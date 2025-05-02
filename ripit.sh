@@ -281,7 +281,7 @@ ${BOLD}${GREEN}Options:${RESET}
   ${YELLOW}-o <dir>${RESET}      Specify output directory (default: ~/music/YTdownloads)
   ${YELLOW}-d <db>${RESET}       Silence detection threshold in dB (default: -30)
                    Note: Provide only the number, e.g., -d -40
-  ${YELLOW}-s <sec>${RESET}      Minimum silence duration in seconds (default: 2)
+  ${YELLOW}-s <sec>${RESET}      Minimum silence duration in seconds (default: 1)
   ${YELLOW}-l <file>${RESET}     Log file path (optional, appends if exists)
   ${YELLOW}-h${RESET}             Show this help message
 
@@ -298,7 +298,7 @@ EOF
   # --- Argument Parsing ---
   local BASE_MUSIC_DIR="$HOME/music/YTdownloads"
   local SILENCE_DB="-30" # Store as number, add 'dB' later
-  local SILENCE_SEC="2"
+  local SILENCE_SEC="1"
   local LOG_FILE="" # Initialize, might be set by -l
 
   # Use getopts for robust option parsing
@@ -325,12 +325,15 @@ EOF
   shift # Consume the URL argument
 
   # Validate numeric options
+  # *** FIX: Correct regex for decimal/integer validation ***
+# Allows: 2, 1.5, .5, 0.5, 3.
+  
   if ! [[ "$SILENCE_DB" =~ ^-?[0-9]+$ ]]; then
       log_message "ERROR" "Silence dB threshold must be an integer (e.g., -30). Got: '$SILENCE_DB'"
       return 1
   fi
-  if ! [[ "$SILENCE_SEC" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-      log_message "ERROR" "Silence duration must be a number (e.g., 2 or 1.5). Got: '$SILENCE_SEC'"
+  if ! [[ "$SILENCE_SEC" =~ ^([0-9]+(\.[0-9]*)?|\.[0-9]+)$ ]]; then
+      log_message "ERROR" "Silence duration must be a number (e.g., 2, 1.5, 0.8). Got: '$SILENCE_SEC'"
       return 1
   fi
 
