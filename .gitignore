@@ -1,0 +1,34 @@
+# Ignore downloaded audio files and directories
+music/
+YTdownloads/
+oldwork/
+roocode/
+*.mp3
+*.webp
+*.jpg
+*.png
+
+# Ignore log files
+*.log
+yt_rip.log
+
+# Ignore temporary files and directories
+tmp/
+*.tmp
+
+# Ignore sensitive configuration files
+.secrets
+.env
+
+# Ignore common editor and OS files
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Ignore archive file
+downloaded_archive.txt
+
+# Ignore collection index file
+.yt_collection_index.txt

@@ -1,0 +1,10 @@
+# System dependencies for ripit
+# Install these before running the script.
+
+yt-dlp
+ffmpeg
+jq
+
+# Standard Unix tools (grep, sed, sort, mktemp, date) are expected to be pre-installed.
+# On macOS, if you want GNU versions, consider installing coreutils:
+# brew install coreutils
