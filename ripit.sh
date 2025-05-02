@@ -105,7 +105,7 @@ log_message() {
 
 # --- Dependency Check ---
 log_message "DEBUG" "Checking for required commands..."
-for cmd in yt-dlp ffmpeg jq mktemp date grep sed sort awk printf wc tr find; do # Added wc, tr, find
+for cmd in yt-dlp ffmpeg jq mktemp date grep sed sort awk printf wc tr find dirname mkdir touch; do # Added dirname, mkdir, touch
   if ! command -v "$cmd" >/dev/null 2>&1; then
     log_message "ERROR" "Required command '$cmd' not found in PATH. Please install it (e.g., using 'brew install $cmd' on macOS)."
     exit 1
@@ -121,8 +121,9 @@ fi
 
 # --- Sanitization Function ---
 sanitize_filename() {
+  # Replaces problematic characters including / with _
   echo "$1" | sed \
-    -e 's/[\\/:\*\?"<>|$'"'"']\+/_/g' `# Replace forbidden characters with underscore` \
+    -e 's#[\\/:\*\?"<>|$'"'"']\+#_#g' `# Replace forbidden characters (including /) with underscore` \
     -e 's/[[:space:]]\+/_/g'          `# Replace whitespace sequences with underscore` \
     -e 's/__\+/_/g'                   `# Collapse multiple underscores` \
     -e 's/^_//'                       `# Remove leading underscore` \
@@ -298,7 +299,7 @@ EOF
   local BASE_MUSIC_DIR="$HOME/music/YTdownloads"
   local SILENCE_DB="-30" # Store as number, add 'dB' later
   local SILENCE_SEC="2"
-  local LOG_FILE=""
+  local LOG_FILE="" # Initialize, might be set by -l
 
   # Use getopts for robust option parsing
   while getopts ":o:d:s:l:h" opt; do
@@ -306,7 +307,7 @@ EOF
       o) BASE_MUSIC_DIR="$OPTARG" ;;
       d) SILENCE_DB="$OPTARG" ;;
       s) SILENCE_SEC="$OPTARG" ;;
-      l) LOG_FILE="$OPTARG" ;;
+      l) LOG_FILE="$OPTARG" ;; # Set LOG_FILE if -l is used
       h) usage; return 0 ;;
       \?) log_message "ERROR" "Invalid option: -$OPTARG"; usage; return 1 ;;
       :) log_message "ERROR" "Option -$OPTARG requires an argument."; usage; return 1 ;;
@@ -344,6 +345,10 @@ EOF
 
   # --- Log File Header ---
   if [ -n "$LOG_FILE" ]; then
+      # Ensure log directory exists
+      local log_dir
+      log_dir=$(dirname "$LOG_FILE")
+      mkdir -p "$log_dir" || { echo "ERROR: Could not create log directory '$log_dir'. Exiting." >&2; exit 1; }
       # Check if file exists and is empty, write header if needed
       if [ ! -s "$LOG_FILE" ]; then
           local header_ts
@@ -431,7 +436,16 @@ EOF
           description=$(echo "$video_info_json" | jq -r '.description // empty')
       fi
   fi
-  # Update context AFTER fetching title
+  # *** FIX: Sanitize title *before* using it for context or paths ***
+  local sanitized_video_title
+  sanitized_video_title=$(sanitize_filename "$video_title")
+  # Handle empty sanitized title
+  if [ -z "$sanitized_video_title" ]; then
+    log_message "WARN" "Sanitized title is empty after cleanup. Using 'untitled'."
+    sanitized_video_title="untitled"
+  fi
+
+  # Use the ORIGINAL title for context logging
   CURRENT_LOG_CONTEXT="$video_title"
 
   # Log detected type with emphasis (only if type is known)
@@ -451,20 +465,12 @@ EOF
       log_message "DEBUG" "Logging context test: Title set to '$CURRENT_LOG_CONTEXT'"
   fi
 
-  local sanitized_video_title
-  sanitized_video_title=$(sanitize_filename "$video_title")
-  # Handle empty sanitized title
-  if [ -z "$sanitized_video_title" ]; then
-    log_message "WARN" "Sanitized title is empty after cleanup. Using 'untitled'."
-    sanitized_video_title="untitled"
-  fi
-
-  # Output directory is named after the playlist title or video title
+  # *** FIX: Use SANITIZED title for output directory ***
   local output_base_dir="$BASE_MUSIC_DIR/$sanitized_video_title"
 
   echo -e "\n${BOLD}${MAGENTA}📝 DETAILS 📝${RESET}"
-  log_message "INFO" "Title: ${CYAN}$video_title${RESET}"
-  log_message "INFO" "Sanitized Name: ${CYAN}$sanitized_video_title${RESET}"
+  log_message "INFO" "Title: ${CYAN}$video_title${RESET}" # Log original title
+  log_message "INFO" "Sanitized Name (for paths): ${CYAN}$sanitized_video_title${RESET}" # Log sanitized name
   log_message "INFO" "Output Base Directory: ${CYAN}$output_base_dir${RESET}"
   log_message "INFO" "Using Archive File: ${CYAN}$ARCHIVE_FILE${RESET}"
 
@@ -478,13 +484,13 @@ EOF
   local downloaded_audio_file # Path for single video file (used only if not playlist)
 
   if [ "$is_playlist" -eq 1 ]; then
-    # Playlist: Use index and title for separate files within the playlist-named directory
+    # Playlist: Use index and title for separate files within the SANITIZED playlist-named directory
     output_template="$output_base_dir/%(playlist_index)02d - %(title)s.%(ext)s"
     log_message "INFO" "Using playlist output template: $output_template"
     # No single file to split later
     downloaded_audio_file=""
   else
-    # Single Video (or unknown type): Save as one file named after the video/URL title
+    # Single Video (or unknown type): Save as one file named after the SANITIZED video/URL title
     output_template="$output_base_dir/$sanitized_video_title.%(ext)s"
     log_message "INFO" "Using single video output template: $output_template"
     # Define the expected single file path for later splitting checks
