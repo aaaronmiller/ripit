@@ -157,6 +157,22 @@ timestamp_to_seconds() {
   echo "$seconds"
 }
 
+# --- SoundCloud User Profile Check Function ---
+is_soundcloud_user_profile() {
+  local url="$1"
+  # Check if it's a soundcloud.com URL and doesn't contain /sets/ or /tracks/
+  if [[ "$url" == *"soundcloud.com"* ]] && \
+     [[ "$url" != *"soundcloud.com/sets/"* ]] && \
+     [[ "$url" != *"soundcloud.com/tracks/"* ]]; then
+    # Further check if it's likely a user profile (e.g., soundcloud.com/username)
+    # This is a heuristic, might need refinement.
+    if echo "$url" | grep -qE 'soundcloud\.com/[a-zA-Z0-9_-]+/?$'; then
+      return 0 # Is a user profile
+    fi
+  fi
+  return 1 # Not a user profile
+}
+
 # --- Description Parsing for Titles Function ---
 parse_description_for_titles() {
   local line cleaned_line
@@ -379,12 +395,41 @@ EOF
 
   local video_info_json="" # Will store JSON for single video if detected
   local video_title="" description=""
-  local is_playlist=0 # 0=Single, 1=Playlist, -1=Unknown/Error
+  local is_playlist=0 # 0=Single, 1=Playlist, -1=Unknown/Error, 2=SoundCloud User Profile
 
-  # *** FIX: Reliable Playlist Check using --flat-playlist ***
+  # --- SoundCloud User Profile Handling ---
+  if is_soundcloud_user_profile "$target_url"; then
+    log_message "INFO" "Detected ${BOLD}${YELLOW}SoundCloud User Profile${RESET}${GREEN} input. Fetching all tracks/playlists from user." "${BOLD}${YELLOW}"
+    local user_profile_urls
+    # Use --flat-playlist to get all URLs from the user's profile
+    user_profile_urls=$(yt-dlp --flat-playlist --print url -- "$target_url" 2>/dev/null)
+    local user_profile_rc=$?
+
+    if [ "$user_profile_rc" -ne 0 ] || [ -z "$user_profile_urls" ]; then
+      log_message "ERROR" "Failed to fetch URLs from SoundCloud user profile (yt-dlp exit code: $user_profile_rc)."
+      return 1
+    fi
+
+    log_message "INFO" "Found $(echo "$user_profile_urls" | wc -l) items in SoundCloud user profile. Processing each..."
+    local item_count=0
+    while IFS= read -r item_url; do
+      ((item_count++))
+      log_message "INFO" "Processing item $item_count: $item_url"
+      # Recursively call rip for each item found in the user profile
+      # Pass all original options except the URL itself
+      rip "${@:2}" "$item_url" # Pass original options, then the new URL
+      local rip_rc=$?
+      if [ "$rip_rc" -ne 0 ]; then
+        log_message "WARN" "Processing of $item_url failed with exit code $rip_rc. Continuing with next item."
+      fi
+    done <<< "$user_profile_urls"
+    log_message "SUCCESS" "Finished processing all items from SoundCloud user profile."
+    return 0 # Exit successfully after processing all items
+  fi
+
+  # --- Regular Playlist/Single Video Check (if not a SoundCloud User Profile) ---
   echo -ne "${YELLOW}Checking if input is a playlist...${RESET} "
   local playlist_entry_count=0
-  # Run yt-dlp, capture output to variable, suppress stderr, get exit code
   local id_list_output
   id_list_output=$(yt-dlp --flat-playlist --print id -- "$target_url" 2>/dev/null)
   local check_rc=$?
@@ -394,13 +439,11 @@ EOF
       log_message "WARN" "Could not reliably check if input is a playlist (yt-dlp exit code: $check_rc). Assuming single video."
       is_playlist=-1 # Unknown
   else
-      # Count lines in the output
       playlist_entry_count=$(echo "$id_list_output" | wc -l)
       if (( playlist_entry_count > 1 )); then
           echo -e "${GREEN}Yes (${playlist_entry_count} entries)${RESET}"
           is_playlist=1
       else
-          # If only 0 or 1 ID is printed, it's likely a single video URL
           echo -e "${GREEN}No (0 or 1 entry)${RESET}"
           is_playlist=0
       fi
@@ -409,8 +452,6 @@ EOF
   # Now fetch detailed metadata (title, description etc.) for logging and naming
   echo -ne "${YELLOW}Fetching title and details...${RESET} "
   local meta_fetch_opts=("--dump-json")
-  # If we positively identified a playlist, fetch playlist metadata
-  # Otherwise (single or unknown), fetch video metadata (use --no-playlist)
   if [ "$is_playlist" -eq 0 ] || [ "$is_playlist" -eq -1 ]; then
       meta_fetch_opts+=("--no-playlist")
   fi
@@ -421,9 +462,32 @@ EOF
   if [ "$json_fetch_rc" -ne 0 ] || [ -z "$video_info_json" ]; then
       echo -e "${RED}Failed!${RESET}"
       log_message "WARN" "Could not fetch detailed JSON metadata (yt-dlp exit code: $json_fetch_rc)."
-      video_title="Unknown_Title_Fetch_Failed"
+      
+      # Special handling for SoundCloud playlists/sets (not user profiles)
+      if [[ "$target_url" == *"soundcloud.com/sets/"* ]]; then
+          log_message "INFO" "Attempting alternative SoundCloud set/playlist title extraction..."
+          # Try to get the title directly from the URL or a simpler yt-dlp command
+          video_title=$(yt-dlp --get-title --no-playlist -- "$target_url" 2>/dev/null)
+          if [ $? -eq 0 ] && [ -n "$video_title" ]; then
+              log_message "INFO" "Extracted SoundCloud set/playlist title: $video_title"
+          else
+              video_title="Unknown_SoundCloud_Set"
+              log_message "WARN" "Using fallback title for SoundCloud set/playlist"
+          fi
+      elif [[ "$target_url" == *"soundcloud.com/tracks/"* ]]; then
+          log_message "INFO" "Attempting alternative SoundCloud track title extraction..."
+          video_title=$(yt-dlp --get-title --no-playlist -- "$target_url" 2>/dev/null)
+          if [ $? -eq 0 ] && [ -n "$video_title" ]; then
+              log_message "INFO" "Extracted SoundCloud track title: $video_title"
+          else
+              video_title="Unknown_SoundCloud_Track"
+              log_message "WARN" "Using fallback title for SoundCloud track"
+          fi
+      else
+          video_title="Unknown_Title_Fetch_Failed"
+      fi
+      
       description=""
-      # Don't override is_playlist if the initial check succeeded
       if [ "$is_playlist" -ne 1 ]; then
           is_playlist=-1 # Update to unknown if initial check also failed/was single
       fi
@@ -432,7 +496,7 @@ EOF
       log_message "DEBUG" "Detailed JSON metadata fetched successfully."
       # Extract title based on detected type
       if [ "$is_playlist" -eq 1 ]; then
-          video_title=$(echo "$video_info_json" | jq -r '.title // .playlist_title // "untitled_playlist"')
+          video_title=$(echo "$video_info_json" | jq -r '.playlist_title // .title // "untitled_playlist"')
           description="" # Not needed for playlist download
       else # is_playlist is 0 or -1
           video_title=$(echo "$video_info_json" | jq -r '.title // "untitled_video"')
@@ -448,8 +512,8 @@ EOF
     sanitized_video_title="untitled"
   fi
 
-  # Use the ORIGINAL title for context logging
-  CURRENT_LOG_CONTEXT="$video_title"
+  # Use the SANITIZED title for context logging to avoid issues with special characters
+  CURRENT_LOG_CONTEXT=$(sanitize_filename "$video_title")
 
   # Log detected type with emphasis (only if type is known)
   if [ "$is_playlist" -eq 1 ]; then
@@ -536,11 +600,6 @@ EOF
   # --- Handle Download Result ---
   if [ "$yt_dlp_download_code" -eq 101 ]; then
     log_message "SUCCESS" "Video(s) already present in download archive '$ARCHIVE_FILE'."
-    # For single video, still check if the file exists for potential splitting
-    if [ "$is_playlist" -eq 0 ] && [ -n "$downloaded_audio_file" ] && [ ! -f "$downloaded_audio_file" ]; then
-      log_message "WARN" "Video in archive, but expected file not found: $downloaded_audio_file. Splitting might fail."
-      # Allow script to continue, splitting logic will handle file not found
-    fi
     yt_dlp_download_code=0 # Treat as success for subsequent steps
   elif [ "$yt_dlp_download_code" -ne 0 ]; then
     log_message "WARN" "yt-dlp download command failed or was interrupted (code $yt_dlp_download_code)."
