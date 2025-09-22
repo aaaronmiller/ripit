@@ -121,13 +121,22 @@ fi
 
 # --- Sanitization Function ---
 sanitize_filename() {
-  # Replaces problematic characters including / with _
-  echo "$1" | sed \
-    -e 's#[\\/:\*\?"<>|$'"'"']\+#_#g' `# Replace forbidden characters (including /) with underscore` \
-    -e 's/[[:space:]]\+/_/g'          `# Replace whitespace sequences with underscore` \
-    -e 's/__\+/_/g'                   `# Collapse multiple underscores` \
-    -e 's/^_//'                       `# Remove leading underscore` \
-    -e 's/_$//'                       `# Remove trailing underscore`
+  # Replaces problematic characters including / with _, limits length, ensures safe filenames
+  local sanitized
+  sanitized=$(echo "$1" | sed \
+    -e 's#[^a-zA-Z0-9._-]#_#g' `# Replace any non-alphanumeric, dot, underscore, dash with underscore` \
+    -e 's/__\+/_/g'             `# Collapse multiple underscores` \
+    -e 's/^_//'                 `# Remove leading underscore` \
+    -e 's/_$//'                 `# Remove trailing underscore`)
+  # Limit length to 100 characters
+  sanitized=${sanitized:0:100}
+  # Remove trailing underscore after truncation
+  sanitized=$(echo "$sanitized" | sed 's/_$//')
+  # Ensure not empty
+  if [ -z "$sanitized" ]; then
+    sanitized="untitled"
+  fi
+  echo "$sanitized"
 }
 
 # --- Timestamp Conversion Function ---
