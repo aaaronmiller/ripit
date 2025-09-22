@@ -935,11 +935,21 @@ EOF
         echo -e "\n${BOLD}${YELLOW}⚠️ Splitting had errors. Original file preserved.${RESET}"
         log_message "INFO" "Cleaning up any partially created split files..."
         for file in "${split_files[@]}"; do
-           if [ -f "$file" ]; then
-              log_message "DEBUG" "Removing partial split file: $file"
-              rm -f "$file"
-           fi
+          if [ -f "$file" ]; then
+            log_message "DEBUG" "Removing partial split file: $file"
+            rm -f "$file"
+          fi
         done
+      fi
+
+      # Remove from archive if splitting failed
+      if (( num_segments > 0 )) && [ "$split_success" -eq 0 ]; then
+        local video_id
+        video_id=$(echo "$video_info_json" | jq -r '.id // empty')
+        if [ -n "$video_id" ]; then
+          sed -i "/^$video_id$/d" "$ARCHIVE_FILE"
+          log_message "INFO" "Removed $video_id from download archive due to splitting failure."
+        fi
       fi
     else
       # No segments found or splitting method identified
@@ -963,6 +973,38 @@ EOF
         log_message "SUCCESS" "Playlist download complete. ${BOLD}${YELLOW}${final_track_count}${RESET}${GREEN} tracks saved/archived by yt-dlp." "${BOLD}${YELLOW}"
         echo -e "\n${BOLD}${GREEN}✅ Playlist download complete! Tracks are ready in:${RESET}"
         echo -e "${BOLD}${CYAN}$output_base_dir${RESET}"
+
+        # Verify downloaded files and remove invalid from archive
+        local playlist_json
+        playlist_json=$(yt-dlp --dump-json --flat-playlist -- "$target_url" 2>/dev/null)
+        if [ $? -eq 0 ] && [ -n "$playlist_json" ]; then
+          mapfile -t playlist_ids < <(echo "$playlist_json" | jq -r '.entries[].id')
+          local valid_count=0
+          for file in "$output_base_dir"/*.mp3; do
+            if [ -f "$file" ]; then
+              if [ -s "$file" ]; then
+                ((valid_count++))
+              else
+                log_message "WARN" "Removing invalid (empty) file: $file"
+                rm -f "$file"
+                # Remove from archive
+                local index
+                index=$(basename "$file" | sed -n 's/^\([0-9]\+\).*/\1/p')
+                if [ -n "$index" ]; then
+                  local idx=$((index - 1))
+                  if [ $idx -ge 0 ] && [ $idx -lt ${#playlist_ids[@]} ]; then
+                    local vid_id=${playlist_ids[$idx]}
+                    sed -i "/^$vid_id$/d" "$ARCHIVE_FILE"
+                    log_message "INFO" "Removed $vid_id from download archive due to invalid file."
+                  fi
+                fi
+              fi
+            fi
+          done
+          log_message "INFO" "Verified $valid_count valid tracks out of $final_track_count downloaded."
+        else
+          log_message "WARN" "Could not fetch playlist JSON for verification."
+        fi
     else # is_playlist == -1
         log_message "WARN" "Could not determine input type, but download completed. ${BOLD}${YELLOW}${final_track_count}${RESET}${YELLOW} file(s) are in:" "${BOLD}${YELLOW}"
         echo -e "${BOLD}${CYAN}$output_base_dir${RESET}"

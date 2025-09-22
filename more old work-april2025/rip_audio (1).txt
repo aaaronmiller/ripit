@@ -1,0 +1,396 @@
+#!/bin/bash
+# Enhanced YouTube audio rip script with playlist support, silence detection, chapter parsing, audio track labeling, and collection management.
+#
+# Usage:
+#   ./rip_audio.sh [--add <youtube_url>] [--help] [<youtube_url_or_id>]
+#
+# Description:
+#   - If no arguments are provided, updates the collection by ripping new videos from URLs in the index file.
+#   - If a YouTube URL or video ID is provided, rips audio from that single video.
+#   - Use --add <youtube_url> to add a YouTube channel/playlist URL to the index file.
+#   - Use --help to display usage information.
+#
+# Features:
+#   - Rips audio from individual videos with splitting based on chapters, timestamps, or silence.
+#   - Manages a collection of YouTube channels/playlists, ripping new videos as they are added.
+
+# --- Configuration ---
+BASE_MUSIC_DIR="${YT_DOWNLOAD_DIR:-$HOME/music/YTdownloads}"
+INDEX_FILE="$HOME/.yt_collection_index.txt"
+LOG_FILE="$HOME/yt_rip.log"
+LOG_LEVEL="INFO"
+SILENCE_DB="${SILENCE_DB:--30dB}"
+SILENCE_SEC="${SILENCE_SEC:-2}"
+
+# --- Temporary Files ---
+TMP_DIR=$(mktemp -d)
+cleanup() {
+  rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT INT TERM HUP
+
+# --- Logging Function ---
+log_message() {
+  local level="$1"
+  local message="$2"
+  local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+  local log_line="[$timestamp] [$level] $message"
+  echo "$log_line" >> "$LOG_FILE"
+  case "$LOG_LEVEL" in
+    DEBUG) echo "$log_line" ;;
+    INFO) [[ "$level" == "INFO" || "$level" == "WARN" || "$level" == "ERROR" ]] && echo "$log_line" ;;
+    WARN) [[ "$level" == "WARN" || "$level" == "ERROR" ]] && echo "$log_line" ;;
+    ERROR) [[ "$level" == "ERROR" ]] && echo "$log_line" ;;
+  esac
+}
+
+# --- Dependency Check ---
+log_message "DEBUG" "Checking for required commands..."
+for cmd in yt-dlp ffmpeg jq mktemp date grep sed sort; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    log_message "ERROR" "Required command '$cmd' not found. Please install it."
+    exit 1
+  fi
+done
+log_message "DEBUG" "All required commands found."
+
+# --- Sanitization Function ---
+sanitize_filename() {
+  echo "$1" | sed \
+    -e 's/[\\/:\*\?"<>|$'"'"']\+/_/g' \
+    -e 's/[[:space:]]\+/_/g' \
+    -e 's/__\+/_/g' \
+    -e 's/^_//' \
+    -e 's/_$//'
+}
+
+# --- Timestamp Conversion Function ---
+timestamp_to_seconds() {
+  local ts=$1
+  local seconds=0
+  IFS=: read -ra parts <<< "$ts"
+  local count=${#parts[@]}
+  if [[ $count -eq 3 ]]; then
+    seconds=$((10#${parts[0]} * 3600 + 10#${parts[1]} * 60 + 10#${parts[2]}))
+  elif [[ $count -eq 2 ]]; then
+    seconds=$((10#${parts[0]} * 60 + 10#${parts[1]}))
+  elif [[ $count -eq 1 ]]; then
+    seconds=$((10#${parts[0]}))
+  fi
+  echo $seconds
+}
+
+# --- Description Parsing for Titles ---
+parse_description_for_titles() {
+  local skip_patterns='^(tracklist|track list|timestamps):?$|^https?:|^[-=_*#[:space:]]+$'
+  local title_found=0
+  while IFS= read -r line; do
+    line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [ -z "$line" ] && continue
+    if echo "$line" | grep -iqE "$skip_patterns"; then
+      continue
+    fi
+    cleaned_line=$(echo "$line" | sed -E 's/^[[:space:]]*([0-9]+[\.\)]?|-|\*)[[:space:]]+//')
+    if [ "$cleaned_line" != "$line" ]; then
+      line="$cleaned_line"
+    fi
+    if [ -n "$line" ]; then
+      echo "$line"
+      title_found=1
+    fi
+  done
+  [ "$title_found" -eq 1 ] && return 0 || return 1
+}
+
+# --- Silence Detection Function ---
+detect_silence_points() {
+  local audio_file="$1" noise_db="$2" duration_s="$3"
+  logプト_message "INFO" "Running silence detection (noise=${noise_db}, duration=${duration_s}s) on: $(basename "$audio_file")"
+  ffmpeg_output=$(ffmpeg -hide_banner -nostats -i "$audio_file" \
+    -af silencedetect=noise="${noise_db}":duration="${duration_s}" -f null - 2>&1)
+  exit_code=$?
+  if [ $exit_code -ne 0 ] && echo "$ffmpeg_output" | grep -Eq "Error|Invalid|Cannot|Could not"; then
+    log_message "ERROR" "ffmpeg failed during silence detection (code $exit_code)."
+    return 1
+  fi
+  silence_points=$(echo "$ffmpeg_output" | sed -n 's/.*silence_start: \([0-9.]*\).*/\1/p')
+  if [ -z "$silence_points" ]; then
+    log_message "WARN" "No silence points found (noise=${noise_db}, duration=${duration_s}s)."
+    return 1
+  fi
+  echo "$silence_points" | sort -n
+  return 0
+}
+
+# --- Rip Function ---
+rip() {
+  [ -z "$1" ] && { log_message "ERROR" "No YouTube URL/ID provided."; return 1; }
+  local target_url="$1" overall_rc=0
+  mkdir -p "$BASE_MUSIC_DIR" || { log_message "ERROR" "Cannot create '$BASE_MUSIC_DIR'."; return 1; }
+  log_message "INFO" "Processing: $target_url"
+
+  local video_info_json=$(yt-dlp --print-json --skip-download -- "$target_url" 2>/dev/null)
+  [ $? -ne 0 ] || [ -z "$video_info_json" ] && { log_message "ERROR" "Failed to fetch metadata."; return 1; }
+
+  local video_title=$(echo "$video_info_json" | jq -r '.title // empty')
+  local playlist_title=$(echo "$video_info_json" | jq -r '.playlist_title // empty')
+  local playlist_index=$(echo "$video_info_json" | jq -r '.playlist_index // empty')
+  local description=$(echo "$video_info_json" | jq -r '.description // empty')
+  [ -z "$video_title" ] && { log_message "ERROR" "No video title extracted."; return 1; }
+
+  if [ -n "$playlist_title" ]; then
+    log_message "INFO" "Part of playlist: $playlist_title"
+    local sanitized_playlist_title=$(sanitize_filename "$playlist_title")
+    local output_dir="$BASE_MUSIC_DIR/$sanitized_playlist_title"
+    mkdir -p "$output_dir" || { log_message "ERROR" "Cannot create '$output_dir'."; return 1; }
+    local index_str=$(printf "%02d" "$playlist_index")
+    local sanitized_title=$(sanitize_filename "$video_title")
+    local output_filename="$output_dir/$index_str - $sanitized_title.mp3"
+
+    if [ -f "$output_filename" ]; then
+      log_message "INFO" "File exists: $output_filename. Skipping download."
+    else
+      log_message "INFO" "Downloading to $output_filename"
+      yt-dlp -f bestaudio -x --audio-format mp3 --audio-quality 0 \
+        --embed-metadata --add-metadata --embed-thumbnail \
+        --parse-metadata "playlist_index:track" \
+        --parse-metadata "title:title" \
+        --parse-metadata "playlist_title:album" \
+        -o "$output_filename" --no-part -- "$target_url"
+      [ $? -ne 0 ] && { log_message "ERROR" "Download failed for $target_url"; overall_rc=1; }
+    fi
+  else
+    log_message "INFO" "Single video: $video_title"
+    local sanitized_title=$(sanitize_filename "$video_title")
+    local output_dir="$BASE_MUSIC_DIR/$sanitized_title"
+    local downloaded_audio_file="$output_dir/$sanitized_title.mp3"
+    mkdir -p "$output_dir" || { log_message "ERROR" "Cannot create '$output_dir'."; return 1; }
+
+    if [ -f "$downloaded_audio_file" ]; then
+      log_message "INFO" "File exists: $downloaded_audio_file. Proceeding to split."
+    else
+      log_message "INFO" "Downloading to $downloaded_audio_file"
+      yt-dlp -f bestaudio -x --audio-format mp3 --audio-quality 0 \
+        --embed-metadata --add-metadata --embed-thumbnail \
+        -o "$downloaded_audio_file" --no-part -- "$target_url"
+      [ $? -ne 0 ] && { log_message "ERROR" "Download failed."; overall_rc=1; return $overall_rc; }
+    fi
+
+    if [ -f "$downloaded_audio_file" ]; then
+      local segments=() split_success=0 split_method="None"
+
+      local chapters_count=$(echo "$video_info_json" | jq -r '.chapters // [] | length')
+      if [ "$chapters_count" -gt 0 ]; then
+        log_message "INFO" "Found $chapters_count chapters."
+        local i=1
+        while IFS= read -r chapter; do
+          local start=$(echo "$chapter" | jq -r '.start_time // 0' | awk '{printf "%.0f", $1}')
+          local end=$(echo "$chapter" | jq -r '.end_time // "null"')
+          local title=$(echo "$chapter" | jq -r '.title // empty')
+          title=${title:-"Chapter_$i"}
+          local safe_title=$(sanitize_filename "$title")
+          local end_sec="EOF"
+          [ "$end" != "null" ] && end_sec=$(echo "$end" | awk '{printf "%.0f", $1}')
+          segments+=("$start $end_sec $safe_title")
+          ((i++))
+        done < <(echo "$video_info_json" | jq -c '.chapters[]')
+        split_method="Chapters"
+      fi
+
+      if [ "$split_method" == "None" ] && [ -n "$description" ]; then
+        log_message "INFO" "Checking description for timestamps..."
+        local tracks=()
+        while IFS= read -r line; do
+          if [[ "$line" =~ ^[[:space:]]*(([0-9]+):)?([0-9]+:[0-9]{2})[[:space:]]+(.+)$ ]]; then
+            local ts="${BASH_REMATCH[1]}${BASH_REMATCH[3]}"
+            local title="${BASH_REMATCH[4]}"
+            local start=$(timestamp_to_seconds "$ts")
+            local safe_title=$(sanitize_filename "$title")
+            tracks+=("$start $safe_title")
+          fi
+        done <<< "$description"
+        if [ ${#tracks[@]} -gt 1 ]; then
+          IFS=$'\n' sorted_tracks=($(sort -n -k1 <<<"${tracks[*]}"))
+          unset IFS
+          for ((i=0; i<${#sorted_tracks[@]}-1; i++)); do
+            read -r start title <<< "${sorted_tracks[i]}"
+            read -r next_start _ <<< "${sorted_tracks[i+1]}"
+            segments+=("$start $next_start $title")
+          done
+          read -r start title <<< "${sorted_tracks[-1]}"
+          segments+=("$start EOF $title")
+          split_method="Timestamps"
+        fi
+      fi
+
+      if [ "$split_method" == "None" ] && [ -n "$description" ]; then
+        log_message "INFO" "Trying silence detection with titles..."
+        local title_list=()
+        while IFS= read -r line; do title_list+=("$line"); done < <(echo "$description" | parse_description_for_titles)
+        local silence_points=($(detect_silence_points "$downloaded_audio_file" "$SILENCE_DB" "$SILENCE_SEC"))
+        if [ ${#silence_points[@]} -gt 0 ] && [ ${#title_list[@]} -eq $(( ${#silence_points[@]} + 1 )) ]; then
+          local start=0
+          for ((i=0; i<${#title_list[@]}-1; i++)); do
+            local end=${silence_points[i]%.*}
+            local title=$(sanitize_filename "${title_list[i]}")
+            segments+=("$start $end $title")
+            start=$end
+          done
+          local title=$(sanitize_filename "${title_list[-1]}")
+          segments+=("$start EOF $title")
+          split_method="Silence with Titles"
+        fi
+      fi
+
+      if [ "$split_method" == "None" ]; then
+        log_message "INFO" "Falling back to silence detection only..."
+        local silence_points=($(detect_silence_points "$downloaded_audio_file" "$SILENCE_DB" "$SILENCE_SEC"))
+        if [ ${#silence_points[@]} -gt 0 ]; then
+          local start=0 i=1
+          for end in "${silence_points[@]}"; do
+            local end_sec=${end%.*}
+            segments+=("$start $end_sec Track_$i")
+            start=$end_sec
+            ((i++))
+          done
+          segments+=("$start EOF Track_$i")
+          split_method="Silence Only"
+        fi
+      fi
+
+      if [ ${#segments[@]} -gt 0 ]; then
+        log_message "INFO" "Splitting into ${#segments[@]} tracks using $split_method..."
+        local i=1
+        for segment in "${segments[@]}"; do
+          read -r start end title <<< "$segment"
+          local output_file=$(printf "%s/%03d - %s.mp3" "$output_dir" "$i" "$title")
+          local end_opt=()
+          [ "$end" != "EOF" ] && end_opt=(-to "$end")
+          ffmpeg -hide_banner -loglevel error -i "$downloaded_audio_file" -ss "$start" "${end_opt[@]}" \
+            -vn -acodec copy -metadata track="$i/${#segments[@]}" -metadata title="$title" \
+            -metadata album="$video_title" -y "$output_file"
+          [ $? -eq 0 ] || { log_message "ERROR" "Split failed for segment $i."; overall_rc=1; }
+          ((i++))
+        done
+        if [ $overall_rc -eq 0 ]; then
+          rm -f "$downloaded_audio_file"
+          log_message "INFO" "Split successful; original file removed."
+        fi
+      else
+        log_message "INFO" "No splitting possible; keeping original file."
+      fi
+    fi
+  fi
+
+  find "$output_dir" -maxdepth 1 \( -name "*.webp" -o -name "*.jpg" -o -name "*.png" \) -delete 2>/dev/null || true
+  log_message "INFO" "Finished processing '$video_title'."
+  return $overall_rc
+}
+
+# --- Collection Update Function ---
+update_collection() {
+  log_message "INFO" "==== Starting Collection Update ===="
+  log_message "INFO" "Using Index: $INDEX_FILE"
+  log_message "INFO" "Using Music Dir: $BASE_MUSIC_DIR"
+
+  if [ ! -f "$INDEX_FILE" ] || [ ! -s "$INDEX_FILE" ]; then
+    log_message "ERROR" "Index file is missing or empty: $INDEX_FILE"
+    log_message "ERROR" "Add collection URLs using --add <url> first."
+    exit 1
+  fi
+
+  mapfile -t PAGE_URLS < "$INDEX_FILE"
+  log_message "INFO" "Found ${#PAGE_URLS[@]} collection page(s) in index."
+
+  local ALL_VIDEOS_TMP="$TMP_DIR/all_videos.tmp"
+  local SORTED_VIDEOS_TMP="$TMP_DIR/sorted_videos.tmp"
+  > "$ALL_VIDEOS_TMP"
+
+  log_message "INFO" "--- Discovering Videos ---"
+  total_discovered=0
+  for page_url in "${PAGE_URLS[@]}"; do
+    log_message "INFO" "Fetching video list from: $page_url"
+    while IFS=' ' read -r date_str video_id; do
+      if [[ "$date_str" =~ ^[0-9]{8}$ ]] && [[ -n "$video_id" ]]; then
+        echo "$date_str $video_id" >> "$ALL_VIDEOS_TMP"
+        ((total_discovered++))
+      else
+        log_message "WARN" "Skipping invalid line from yt-dlp output for page '$page_url': date='$date_str', id='$video_id'"
+      fi
+    done < <(yt-dlp --flat-playlist --print "%(upload_date>%Y%m%d)s %(id)s" "$page_url" 2> >(sed "s/^/[$page_url yt-dlp ERR] /" >> "$LOG_FILE"))
+  done
+
+  log_message "INFO" "Discovered $total_discovered potential videos across all pages."
+
+  if [ $total_discovered -eq 0 ]; then
+    log_message "WARN" "No videos discovered. Exiting."
+    exit 0
+  fi
+
+  log_message "INFO" "--- Sorting Videos by Upload Date ---"
+  sort -n -k1,1 "$ALL_VIDEOS_TMP" > "$SORTED_VIDEOS_TMP"
+  if [ $? -ne 0 ]; then
+    log_message "ERROR" "Failed to sort video list."
+    exit 1
+  fi
+
+  log_message "INFO" "--- Processing Sorted Videos ---"
+  processed_count=0
+  ripped_count=0
+  failed_count=0
+
+  while IFS=' ' read -r upload_date video_id; do
+    ((processed_count++))
+    video_url="https://www.youtube.com/watch?v=$video_id"
+    log_message "DEBUG" "Processing $processed_count/$total_discovered: ID=$video_id Date=$upload_date URL=$video_url"
+
+    rip "$video_url"
+    rip_status=$?
+
+    if [ $rip_status -eq 0 ]; then
+      log_message "INFO" "Rip SUCCESSFUL for video ID $video_id."
+      ((ripped_count++))
+    else
+      log_message "ERROR" "Rip FAILED (code $rip_status) for video ID $video_id."
+      ((failed_count++))
+    fi
+  done < "$SORTED_VIDEOS_TMP"
+
+  log_message "INFO" "--- Update Summary ---"
+  log_message "INFO" "Total Videos Considered: $total_discovered"
+  log_message "INFO" "Videos Processed: $processed_count"
+  log_message "INFO" "Ripped Successfully: $ripped_count"
+  log_message "INFO" "Failures: $failed_count"
+  log_message "INFO" "==== Collection Update Finished ===="
+}
+
+# --- Main Logic ---
+if [ "$1" == "--add" ]; then
+  if [ -z "$2" ]; then
+    log_message "ERROR" "--add option requires a URL argument."
+    exit 1
+  fi
+  touch "$INDEX_FILE"
+  if grep -Fxq "$2" "$INDEX_FILE"; then
+    log_message "WARN" "URL already exists in index file: $2"
+    exit 0
+  else
+    log_message "INFO" "Adding URL to index: $2"
+    echo "$2" >> "$INDEX_FILE"
+    [ $? -eq 0 ] && log_message "INFO" "URL added successfully." || log_message "ERROR" "Failed to write to index file."
+    exit 0
+  fi
+elif [ "$1" == "--help" ]; then
+  echo "Usage: $0 [--add <youtube_url>] [--help] [<youtube_url_or_id>]"
+  echo ""
+  echo "  (no arguments)   Update library from URLs in $INDEX_FILE."
+  echo "  --add <url>      Add a YouTube channel/playlist URL to the index."
+  echo "  --help           Display this help message."
+  echo "  <youtube_url_or_id> Rip audio from a single YouTube video."
+  exit 0
+elif [ -z "$1" ]; then
+  update_collection
+else
+  rip "$1"
+  exit $?
+fi

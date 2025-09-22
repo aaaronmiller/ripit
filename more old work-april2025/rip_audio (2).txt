@@ -1,0 +1,168 @@
+#!/bin/bash
+
+# Script to rip audio from YouTube videos or collections
+
+# Configuration
+BASE_MUSIC_DIR="$HOME/Music"
+INDEX_FILE="$HOME/.yt_collection_index.txt"
+LOG_FILE="$HOME/yt_rip.log"
+LOG_LEVEL="INFO"  # Can be INFO, ERROR, DEBUG
+
+# Ensure required tools are installed
+command -v yt-dlp >/dev/null 2>&1 || { echo "yt-dlp is required."; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo "jq is required."; exit 1; }
+command -v ffmpeg >/dev/null 2>&1 || { echo "ffmpeg is required."; exit 1; }
+
+# Ensure index file exists
+[ -f "$INDEX_FILE" ] || touch "$INDEX_FILE"
+
+# Logging function
+log_message() {
+  local level="$1"
+  local message="$2"
+  if [ "$level" == "ERROR" ] || [ "$LOG_LEVEL" == "DEBUG" ] || [ "$level" == "INFO" ]; then
+    echo "[$level] $message" >> "$LOG_FILE"
+    echo "[$level] $message"
+  fi
+}
+
+# Sanitize filename
+sanitize_filename() {
+  echo "$1" | tr -cd '[:alnum:]-_ .' | tr -s ' ' | sed 's/^[.-]*//;s/[.-]*$//'
+}
+
+# Rip audio from a single video
+rip() {
+  local target_url="$1"
+  local preview="$2"
+  local video_info_json
+
+  # Fetch metadata
+  video_info_json=$(yt-dlp --print-json --skip-download -- "$target_url" 2>/dev/null)
+  if [ $? -ne 0 ] || [ -z "$video_info_json" ]; then
+    log_message "ERROR" "Failed to fetch metadata for $target_url"
+    return 1
+  fi
+
+  local video_title=$(echo "$video_info_json" | jq -r '.title // empty')
+  local playlist_title=$(echo "$video_info_json" | jq -r '.playlist_title // empty')
+  local sanitized_title=$(sanitize_filename "$video_title")
+
+  if [ "$preview" == "true" ]; then
+    if [ -n "$playlist_title" ]; then
+      local sanitized_playlist_title=$(sanitize_filename "$playlist_title")
+      local output_dir="$BASE_MUSIC_DIR/$sanitized_playlist_title"
+      local index_str=$(printf "%02d" "$(echo "$video_info_json" | jq -r '.playlist_index // 1')")
+      local output_filename="$output_dir/$index_str - $sanitized_title.mp3"
+      log_message "INFO" "Would download playlist track: $output_filename"
+    else
+      local output_dir="$BASE_MUSIC_DIR/$sanitized_title"
+      log_message "INFO" "Would download single video to: $output_dir/$sanitized_title.mp3"
+      local chapters_count=$(echo "$video_info_json" | jq -r '.chapters // [] | length')
+      if [ "$chapters_count" -gt 0 ]; then
+        log_message "INFO" "Would split into $chapters_count tracks based on chapters."
+      else
+        local description=$(echo "$video_info_json" | jq -r '.description // empty')
+        if [ -n "$description" ]; then
+          local track_count=$(echo "$description" | grep -E '^[[:space:]]*(([0-9]+):)?([0-9]+:[0-9]{2})[[:space:]]+' | wc -l)
+          if [ "$track_count" -gt 1 ]; then
+            log_message "INFO" "Would attempt to split into $track_count tracks based on timestamps."
+          else
+            log_message "INFO" "No chapters or timestamps; would use silence detection or keep as single file."
+          fi
+        fi
+      fi
+    fi
+  else
+    # Actual ripping logic (simplified for brevity)
+    if [ -n "$playlist_title" ]; then
+      local sanitized_playlist_title=$(sanitize_filename "$playlist_title")
+      local output_dir="$BASE_MUSIC_DIR/$sanitized_playlist_title"
+      mkdir -p "$output_dir"
+      local index_str=$(printf "%02d" "$(echo "$video_info_json" | jq -r '.playlist_index // 1')")
+      local output_filename="$output_dir/$index_str - $sanitized_title.mp3"
+      if [ ! -f "$output_filename" ]; then
+        yt-dlp -x --audio-format mp3 -o "$output_filename" "$target_url"
+        log_message "INFO" "Downloaded playlist track: $output_filename"
+      fi
+    else
+      local output_dir="$BASE_MUSIC_DIR/$sanitized_title"
+      if [ ! -d "$output_dir" ]; then
+        mkdir -p "$output_dir"
+        yt-dlp -x --audio-format mp3 -o "$output_dir/%(title)s.%(ext)s" "$target_url"
+        log_message "INFO" "Downloaded single video to: $output_dir"
+        # Add splitting logic here (chapters, timestamps, silence detection) if needed
+      fi
+    fi
+  fi
+}
+
+# Update collection from index file
+update_collection() {
+  local preview="$1"
+  if [ "$preview" == "true" ]; then
+    log_message "INFO" "Preview mode: Simulating collection update."
+  else
+    log_message "INFO" "Starting collection update."
+  fi
+
+  local SORTED_VIDEOS_TMP=$(mktemp)
+  while read -r url; do
+    yt-dlp --flat-playlist --get-id "$url" 2>/dev/null >> "$SORTED_VIDEOS_TMP"
+  done < "$INDEX_FILE"
+
+  while read -r video_id; do
+    [ -z "$video_id" ] && continue
+    local video_url="https://www.youtube.com/watch?v=$video_id"
+    if [ "$preview" == "true" ]; then
+      log_message "INFO" "Would process video: $video_url"
+      rip "$video_url" true
+    else
+      rip "$video_url" false
+    fi
+  done < "$SORTED_VIDEOS_TMP"
+  rm -f "$SORTED_VIDEOS_TMP"
+}
+
+# Usage message
+usage() {
+  echo "Usage: $0 [--add <youtube_url>] [--preview] [--help] [<youtube_url_or_id>]"
+  echo ""
+  echo "  --add <url>      Add a YouTube channel/playlist URL to the index."
+  echo "  --preview        Preview what would be ripped without performing actions."
+  echo "  --help           Display this help message."
+  echo "  <youtube_url_or_id> Rip audio from a single YouTube video."
+  echo ""
+  echo "When run with no arguments, updates the collection from URLs in $INDEX_FILE."
+  echo "In preview mode:"
+  echo "  - With no arguments: Lists videos that would be processed."
+  echo "  - With a URL: Shows what files would be created."
+}
+
+# Main logic
+if [ "$1" == "--help" ]; then
+  usage
+  exit 0
+elif [ "$1" == "--add" ]; then
+  if [ -z "$2" ]; then
+    log_message "ERROR" "--add requires a URL argument."
+    usage
+    exit 1
+  fi
+  echo "$2" >> "$INDEX_FILE"
+  log_message "INFO" "Added $2 to $INDEX_FILE"
+  exit 0
+elif [ "$1" == "--preview" ]; then
+  shift
+  if [ -z "$1" ]; then
+    update_collection true
+  else
+    rip "$1" true
+  fi
+else
+  if [ -z "$1" ]; then
+    update_collection false
+  else
+    rip "$1" false
+  fi
+fi

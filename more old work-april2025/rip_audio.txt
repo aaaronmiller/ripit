@@ -1,0 +1,194 @@
+#!/bin/bash
+# Enhanced YouTube audio rip script with playlist support, silence detection, chapter parsing, and audio track labeling.
+#
+# Usage:
+#   ./rip_audio.sh <youtube_url_or_id>
+#
+# Description:
+#   - If the input is a single video URL/ID, it downloads the audio and attempts to split it into tracks based on:
+#     - Chapters (if available in metadata)
+#     - Timestamps in the description (e.g., "0:00 Track 1")
+#     - Silence detection with optional title matching from the description
+#   - If the video is part of a playlist (detected via metadata), it downloads each video as a single track,
+#     saved in a directory named after the playlist with filenames like "01 - Video Title.mp3".
+#
+# Notes:
+#   - Typically called by a script like update_collections.sh for each video in a playlist or collection.
+#   - Requires yt-dlp, ffmpeg, jq, and standard Unix utilities (grep, sed, sort).
+#   - Playlist videos are not split further; each video is treated as one track.
+#   - Single videos are split into tracks if possible, with the original file removed upon successful splitting.
+
+# --- Configuration ---
+# Base directory where ripped audio is stored (override via YT_DOWNLOAD_DIR env var)
+BASE_MUSIC_DIR="${YT_DOWNLOAD_DIR:-$HOME/music/YTdownloads}"
+# Log file location (optional, uncomment to enable)
+# LOG_FILE="$HOME/rip_audio.log"
+
+# --- Silence Detection Configuration (Override via Env Vars) ---
+# Silence threshold in dB (e.g., -30dB; lower is quieter)
+SILENCE_DB="${SILENCE_DB:--30dB}"
+# Minimum silence duration in seconds
+SILENCE_SEC="${SILENCE_SEC:-2}"
+
+# --- Temporary Files ---
+TMP_DIR=$(mktemp -d)
+cleanup() {
+  rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT INT TERM HUP
+
+# --- Logging Function ---
+log_message() {
+  local level="$1"
+  local message="$2"
+  local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+  echo "[$timestamp] [$level] $message" >&2
+  # Uncomment to log to file
+  # [ -n "$LOG_FILE" ] && echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
+}
+
+# --- Dependency Check ---
+log_message "DEBUG" "Checking for required commands..."
+for cmd in yt-dlp ffmpeg jq mktemp date grep sed sort; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    log_message "ERROR" "Required command '$cmd' not found. Install it (e.g., 'brew install $cmd' on macOS)."
+    exit 1
+  fi
+done
+log_message "DEBUG" "All required commands found."
+
+# --- Sanitization Function ---
+sanitize_filename() {
+  echo "$1" | sed \
+    -e 's/[\\/:\*\?"<>|$'"'"']\+/_/g' \
+    -e 's/[[:space:]]\+/_/g' \
+    -e 's/__\+/_/g' \
+    -e 's/^_//' \
+    -e 's/_$//'
+}
+
+# --- Timestamp Conversion Function ---
+timestamp_to_seconds() {
+  local ts=$1
+  local seconds=0
+  IFS=: read -ra parts <<< "$ts"
+  local count=${#parts[@]}
+  if [[ $count -eq 3 ]]; then
+    seconds=$((10#${parts[0]} * 3600 + 10#${parts[1]} * 60 + 10#${parts[2]}))
+  elif [[ $count -eq 2 ]]; then
+    seconds=$((10#${parts[0]} * 60 + 10#${parts[1]}))
+  elif [[ $count -eq 1 ]]; then
+    seconds=$((10#${parts[0]}))
+  else
+    log_message "WARN" "Could not parse timestamp: '$ts'"
+    seconds=0
+  fi
+  echo $seconds
+}
+
+# --- Description Parsing for Titles ---
+parse_description_for_titles() {
+  local skip_patterns='^(tracklist|track list|timestamps):?$|^https?:|^[-=_*#[:space:]]+$'
+  local title_found=0
+  while IFS= read -r line; do
+    line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [ -z "$line" ] && continue
+    if echo "$line" | grep -iqE "$skip_patterns"; then
+      continue
+    fi
+    cleaned_line=$(echo "$line" | sed -E 's/^[[:space:]]*([0-9]+[\.\)]?|-|\*)[[:space:]]+//')
+    if [ "$cleaned_line" != "$line" ]; then
+      line="$cleaned_line"
+    fi
+    if [ -n "$line" ]; then
+      echo "$line"
+      title_found=1
+    fi
+  done
+  [ "$title_found" -eq 1 ] && return 0 || return 1
+}
+
+# --- Silence Detection Function ---
+detect_silence_points() {
+  local audio_file="$1" noise_db="$2" duration_s="$3"
+  log_message "INFO" "Running silence detection (noise=${noise_db}, duration=${duration_s}s) on: $(basename "$audio_file")"
+  ffmpeg_output=$(ffmpeg -hide_banner -nostats -i "$audio_file" \
+    -af silencedetect=noise="${noise_db}":duration="${duration_s}" -f null - 2>&1)
+  exit_code=$?
+  if [ $exit_code -ne 0 ] && echo "$ffmpeg_output" | grep -Eq "Error|Invalid|Cannot|Could not"; then
+    log_message "ERROR" "ffmpeg failed during silence detection (code $exit_code)."
+    return 1
+  fi
+  silence_points=$(echo "$ffmpeg_output" | sed -n 's/.*silence_start: \([0-9.]*\).*/\1/p')
+  if [ -z "$silence_points" ]; then
+    log_message "WARN" "No silence points found (noise=${noise_db}, duration=${duration_s}s)."
+    return 1
+  fi
+  echo "$silence_points" | sort -n
+  return 0
+}
+
+# --- Main Rip Function ---
+rip() {
+  [ -z "$1" ] && { log_message "ERROR" "No YouTube URL/ID provided."; return 1; }
+  local target_url="$1" overall_rc=0
+  mkdir -p "$BASE_MUSIC_DIR" || { log_message "ERROR" "Cannot create '$BASE_MUSIC_DIR'."; return 1; }
+  log_message "INFO" "Processing: $target_url"
+
+  # Fetch video metadata
+  local video_info_json=$(yt-dlp --print-json --skip-download -- "$target_url" 2>/dev/null)
+  [ $? -ne 0 ] || [ -z "$video_info_json" ] && { log_message "ERROR" "Failed to fetch metadata."; return 1; }
+
+  # Extract metadata
+  local video_title=$(echo "$video_info_json" | jq -r '.title // empty')
+  local playlist_title=$(echo "$video_info_json" | jq -r '.playlist_title // empty')
+  local playlist_index=$(echo "$video_info_json" | jq -r '.playlist_index // empty')
+  local description=$(echo "$video_info_json" | jq -r '.description // empty')
+  [ -z "$video_title" ] && { log_message "ERROR" "No video title extracted."; return 1; }
+
+  if [ -n "$playlist_title" ]; then
+    # --- Playlist Video Handling ---
+    log_message "INFO" "Part of playlist: $playlist_title"
+    local sanitized_playlist_title=$(sanitize_filename "$playlist_title")
+    local output_dir="$BASE_MUSIC_DIR/$sanitized_playlist_title"
+    mkdir -p "$output_dir" || { log_message "ERROR" "Cannot create '$output_dir'."; return 1; }
+    local index_str=$(printf "%02d" "$playlist_index")
+    local sanitized_title=$(sanitize_filename "$video_title")
+    local output_filename="$output_dir/$index_str - $sanitized_title.mp3"
+
+    if [ -f "$output_filename" ]; then
+      log_message "INFO" "File exists: $output_filename. Skipping download."
+    else
+      log_message "INFO" "Downloading to $output_filename"
+      yt-dlp -f bestaudio -x --audio-format mp3 --audio-quality 0 \
+        --embed-metadata --add-metadata --embed-thumbnail \
+        --parse-metadata "playlist_index:track" \
+        --parse-metadata "title:title" \
+        --parse-metadata "playlist_title:album" \
+        -o "$output_filename" --no-part -- "$target_url"
+      [ $? -ne 0 ] && { log_message "ERROR" "Download failed for $target_url"; overall_rc=1; }
+    fi
+  else
+    # --- Single Video Handling ---
+    log_message "INFO" "Single video: $video_title"
+    local sanitized_title=$(sanitize_filename "$video_title")
+    local output_dir="$BASE_MUSIC_DIR/$sanitized_title"
+    local downloaded_audio_file="$output_dir/$sanitized_title.mp3"
+    mkdir -p "$output_dir" || { log_message "ERROR" "Cannot create '$output_dir'."; return 1; }
+
+    if [ -f "$downloaded_audio_file" ]; then
+      log_message "INFO" "File exists: $downloaded_audio_file. Proceeding to split."
+    else
+      log_message "INFO" "Downloading to $downloaded_audio_file"
+      yt-dlp -f bestaudio -x --audio-format mp3 --audio-quality 0 \
+        --embed-metadata --add-metadata --embed-thumbnail \
+        -o "$downloaded_audio_file" --no-part -- "$target_url"
+      [ $? -ne 0 ] && { log_message "ERROR" "Download failed."; overall_rc=1; return $overall_rc; }
+    fi
+
+    # --- Splitting Logic ---
+    if [ -f "$downloaded_audio_file" ]; then
+      local segments=() split_success=0 split_method="None"
+
+      # 1. Chapters
+      local chapters_count=$(echo "$video_info_json" | jq -r
