@@ -212,6 +212,19 @@ parse_description_for_titles() {
   if [ "$title_found" -eq 1 ]; then return 0; else return 1; fi
 }
 
+# --- Spinner Function for Progress Indication ---
+spinner() {
+    local pid=$1
+    local spin='-\|/'
+    local i=0
+    while kill -0 $pid 2>/dev/null; do
+        i=$(( (i+1) %4 ))
+        printf "\r${YELLOW}${spin:$i:1}${RESET}"
+        sleep 0.1
+    done
+    printf "\r"
+}
+
 # --- Silence Detection Function ---
 detect_silence_points() {
   local audio_file="$1"
@@ -411,8 +424,15 @@ EOF
     log_message "INFO" "Detected ${BOLD}${YELLOW}SoundCloud User Profile${RESET}${GREEN} input. Fetching all tracks/playlists from user." "${BOLD}${YELLOW}"
     local user_profile_urls
     # Use --flat-playlist to get all URLs from the user's profile
-    user_profile_urls=$(yt-dlp --flat-playlist --print url -- "$target_url" 2>/dev/null)
+    local temp_file3=$(mktemp)
+    yt-dlp --flat-playlist --print url -- "$target_url" > "$temp_file3" 2>/dev/null &
+    local pid3=$!
+    spinner $pid3
+    wait $pid3
     local user_profile_rc=$?
+
+    user_profile_urls=$(cat "$temp_file3")
+    rm "$temp_file3"
 
     if [ "$user_profile_rc" -ne 0 ] || [ -z "$user_profile_urls" ]; then
       log_message "ERROR" "Failed to fetch URLs from SoundCloud user profile (yt-dlp exit code: $user_profile_rc)."
@@ -440,20 +460,27 @@ EOF
   echo -ne "${YELLOW}Checking if input is a playlist...${RESET} "
   local playlist_entry_count=0
   local id_list_output
-  id_list_output=$(yt-dlp --flat-playlist --print id -- "$target_url" 2>/dev/null)
+  local temp_file2=$(mktemp)
+  yt-dlp --flat-playlist --print id -- "$target_url" > "$temp_file2" 2>/dev/null &
+  local pid2=$!
+  spinner $pid2
+  wait $pid2
   local check_rc=$?
 
+  id_list_output=$(cat "$temp_file2")
+  rm "$temp_file2"
+
   if [ "$check_rc" -ne 0 ]; then
-      echo -e "${RED}Check Failed!${RESET}"
+      echo -e "\r${RED}Check Failed!${RESET}"
       log_message "WARN" "Could not reliably check if input is a playlist (yt-dlp exit code: $check_rc). Assuming single video."
       is_playlist=-1 # Unknown
   else
       playlist_entry_count=$(echo "$id_list_output" | wc -l)
       if (( playlist_entry_count > 1 )); then
-          echo -e "${GREEN}Yes (${playlist_entry_count} entries)${RESET}"
+          echo -e "\r${GREEN}Yes (${playlist_entry_count} entries)${RESET}"
           is_playlist=1
       else
-          echo -e "${GREEN}No (0 or 1 entry)${RESET}"
+          echo -e "\r${GREEN}No (0 or 1 entry)${RESET}"
           is_playlist=0
       fi
   fi
@@ -461,15 +488,24 @@ EOF
   # Now fetch detailed metadata (title, description etc.) for logging and naming
   echo -ne "${YELLOW}Fetching title and details...${RESET} "
   local meta_fetch_opts=("--dump-json")
-  if [ "$is_playlist" -eq 0 ] || [ "$is_playlist" -eq -1 ]; then
+  if [ "$is_playlist" -eq 1 ]; then
+      meta_fetch_opts+=("--flat-playlist")
+  elif [ "$is_playlist" -eq 0 ] || [ "$is_playlist" -eq -1 ]; then
       meta_fetch_opts+=("--no-playlist")
   fi
 
-  video_info_json=$(yt-dlp "${meta_fetch_opts[@]}" -- "$target_url" 2>/dev/null)
+  local temp_file=$(mktemp)
+  yt-dlp "${meta_fetch_opts[@]}" -- "$target_url" > "$temp_file" 2>/dev/null &
+  local pid=$!
+  spinner $pid
+  wait $pid
   local json_fetch_rc=$?
 
+  video_info_json=$(cat "$temp_file")
+  rm "$temp_file"
+
   if [ "$json_fetch_rc" -ne 0 ] || [ -z "$video_info_json" ]; then
-      echo -e "${RED}Failed!${RESET}"
+      echo -e "\r${RED}Failed!${RESET}"
       log_message "WARN" "Could not fetch detailed JSON metadata (yt-dlp exit code: $json_fetch_rc)."
       
       # Special handling for SoundCloud playlists/sets (not user profiles)
@@ -501,7 +537,7 @@ EOF
           is_playlist=-1 # Update to unknown if initial check also failed/was single
       fi
   else
-      echo -e "${GREEN}Success!${RESET}"
+      echo -e "\r${GREEN}Success!${RESET}"
       log_message "DEBUG" "Detailed JSON metadata fetched successfully."
       # Extract title based on detected type
       if [ "$is_playlist" -eq 1 ]; then
