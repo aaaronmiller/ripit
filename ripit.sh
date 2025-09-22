@@ -512,6 +512,9 @@ EOF
           description=$(echo "$video_info_json" | jq -r '.description // empty')
       fi
   fi
+  # Clean the title: remove carriage returns and extra whitespace, take first line only
+  video_title=$(echo "$video_title" | sed 's/\r.*//' | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+
   # *** FIX: Sanitize title *before* using it for context or paths ***
   local sanitized_video_title
   sanitized_video_title=$(sanitize_filename "$video_title")
