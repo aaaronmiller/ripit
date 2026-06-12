@@ -334,7 +334,9 @@ EOF
   }
 
   # --- Argument Parsing ---
-  local BASE_MUSIC_DIR="$HOME/music/YTdownloads"
+  # Default: Windows partition (C:\Users\Administrator\Music\YTdownloads)
+  # Use -o <dir> to override, or edit this path for your system
+  local BASE_MUSIC_DIR="/mnt/c/Users/Administrator/Music/YTdownloads"
   local SILENCE_DB="-30" # Store as number, add 'dB' later
   local SILENCE_SEC="1"
   local LOG_FILE="" # Initialize, might be set by -l
@@ -378,11 +380,19 @@ EOF
   # --- Temporary Files Setup ---
   local TMP_DIR
   TMP_DIR=$(mktemp -d)
+  CLEANUP_DONE=0
   cleanup() {
-    log_message "DEBUG" "Cleaning up temporary directory: $TMP_DIR"
-    rm -rf "$TMP_DIR"
+    # Guard: only clean up once, and only if TMP_DIR was actually set
+    if [[ $CLEANUP_DONE -eq 0 && -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
+      CLEANUP_DONE=1
+      log_message "DEBUG" "Cleaning up temporary directory: $TMP_DIR"
+      rm -rf "$TMP_DIR"
+    fi
   }
-  trap cleanup EXIT INT TERM HUP # Ensure cleanup on exit/interrupt
+  # EXIT trap runs cleanup on any normal exit (return / exit / end-of-script)
+  trap cleanup EXIT
+  # INT (Ctrl+C), TERM, and HUP must actually KILL the script, not just run cleanup
+  trap 'cleanup; exit 1' INT TERM HUP
 
   # --- Log File Header ---
   if [ -n "$LOG_FILE" ]; then
@@ -420,40 +430,241 @@ EOF
   local is_playlist=0 # 0=Single, 1=Playlist, -1=Unknown/Error, 2=SoundCloud User Profile
 
   # --- SoundCloud User Profile Handling ---
+  # --- SoundCloud Artist Page Handling ---
   if is_soundcloud_user_profile "$target_url"; then
-    log_message "INFO" "Detected ${BOLD}${YELLOW}SoundCloud User Profile${RESET}${GREEN} input. Fetching all tracks/playlists from user." "${BOLD}${YELLOW}"
-    local user_profile_urls
-    # Use --flat-playlist to get all URLs from the user's profile
-    local temp_file3=$(mktemp)
-    yt-dlp --flat-playlist --print url -- "$target_url" > "$temp_file3" 2>/dev/null &
-    local pid3=$!
-    spinner $pid3
-    wait $pid3
-    local user_profile_rc=$?
+    # Strip trailing slash and extract artist name from URL
+    local clean_url
+    clean_url=$(echo "$target_url" | sed 's#/$##')
+    local artist_name
+    artist_name=$(echo "$clean_url" | awk -F'/' '{print $NF}')
+    local sanitized_artist
+    sanitized_artist=$(sanitize_filename "$artist_name")
 
-    user_profile_urls=$(cat "$temp_file3")
-    rm "$temp_file3"
-
-    if [ "$user_profile_rc" -ne 0 ] || [ -z "$user_profile_urls" ]; then
-      log_message "ERROR" "Failed to fetch URLs from SoundCloud user profile (yt-dlp exit code: $user_profile_rc)."
+    # Ensure we have something after sanitizing
+    if [ -z "$sanitized_artist" ]; then
+      log_message "ERROR" "Could not determine artist name from URL."
       return 1
     fi
 
-    log_message "INFO" "Found $(echo "$user_profile_urls" | wc -l) items in SoundCloud user profile. Processing each..."
-    local item_count=0
-    while IFS= read -r item_url; do
-      ((item_count++))
-      log_message "INFO" "Processing item $item_count: $item_url"
-      # Recursively call rip for each item found in the user profile
-      # Pass all original options except the URL itself
-      rip "${@:2}" "$item_url" # Pass original options, then the new URL
-      local rip_rc=$?
-      if [ "$rip_rc" -ne 0 ]; then
-        log_message "WARN" "Processing of $item_url failed with exit code $rip_rc. Continuing with next item."
-      fi
-    done <<< "$user_profile_urls"
-    log_message "SUCCESS" "Finished processing all items from SoundCloud user profile."
-    return 0 # Exit successfully after processing all items
+    echo -e "\n${BOLD}${MAGENTA}🎵 SoundCloud Artist: ${CYAN}$artist_name${RESET}${RESET}"
+    echo
+    echo -e "${YELLOW}What would you like to download?${RESET}"
+    echo -e "  ${WHITE}1)${RESET} ${GREEN}Discography${RESET}  — All tracks by ${CYAN}$artist_name${RESET} (their uploads)"
+    echo -e "  ${WHITE}2)${RESET} ${GREEN}Sounds Like${RESET} — Suggested/similar tracks (other artists SoundCloud thinks sound like $artist_name)"
+    echo
+
+    local choice
+    read -p "$(echo -e "${CYAN}Enter choice (1/2) [1]: ${RESET}")" choice
+    choice=${choice:-1}
+
+    case "$choice" in
+      # ======================================================================
+      #  SOUNDS LIKE MODE
+      # ======================================================================
+      2)
+        echo
+        log_message "INFO" "Mode: ${BOLD}${YELLOW}Sounds Like${RESET}"
+
+        # Fetch suggested tracks to count them
+        echo -ne "${YELLOW}Fetching suggested tracks...${RESET} "
+        local sc_suggest_count=0
+        sc_suggest_count=$(yt-dlp --flat-playlist --print "%(title)s" -- "$clean_url" 2>/dev/null | grep -c .)
+        if [ "$sc_suggest_count" -eq 0 ]; then
+          echo -e "\r${RED}No suggested tracks found.${RESET}"
+          log_message "ERROR" "Could not find any suggested tracks. The profile may be empty or inaccessible."
+          return 1
+        fi
+        echo -e "\r${GREEN}Found ${CYAN}$sc_suggest_count${RESET}${GREEN} suggested tracks.${RESET}"
+
+        # Ask how many to download (default 80)
+        local limit=80
+        echo
+        read -p "$(echo -e "${CYAN}How many songs to download? [${limit}]: ${RESET}")" limit_input
+        limit=${limit_input:-80}
+
+        # Folder name with confirmation
+        local default_folder="Sounds Like - $artist_name"
+        local sanitized_folder
+        sanitized_folder=$(sanitize_filename "$default_folder")
+        local output_dir="$BASE_MUSIC_DIR/$sanitized_folder"
+
+        echo
+        echo -e "${BOLD}${MAGENTA}📁 Output Location 📁${RESET}"
+        echo -e "Suggested folder: ${CYAN}$output_dir${RESET}"
+        echo -e "${YELLOW}Press Enter to accept, or type a different folder name:${RESET}"
+        read -p "$(echo -e "${CYAN}> ${RESET}")" folder_override
+        if [ -n "$folder_override" ]; then
+          sanitized_folder=$(sanitize_filename "$folder_override")
+          output_dir="$BASE_MUSIC_DIR/$sanitized_folder"
+        fi
+
+        mkdir -p "$output_dir" || { log_message "ERROR" "Could not create output directory '$output_dir'."; return 1; }
+        echo
+        log_message "INFO" "Downloading up to ${CYAN}$limit${RESET} suggested tracks → ${CYAN}$output_dir${RESET}"
+
+        # Download in batch. Prepend artist name so each file shows who made it.
+        local output_template="$output_dir/%(artist)s - %(title)s.%(ext)s"
+
+        yt-dlp -f bestaudio -x --audio-format mp3 --audio-quality 0 \
+          --embed-metadata --add-metadata --embed-thumbnail \
+          --download-archive "$ARCHIVE_FILE" --no-overwrites \
+          --retries 30 --playlist-end "$limit" \
+          -o "$output_template" -- "$clean_url"
+        local dl_rc=$?
+
+        # Remove stub files (incomplete downloads under 100 KB)
+        local stub_count=0
+        while IFS= read -r -d '' stub_file; do
+          rm -f "$stub_file"
+          ((stub_count++))
+        done < <(find "$output_dir" -name '*.mp3' -type f -size -100k -print0 2>/dev/null)
+        [ "$stub_count" -gt 0 ] && log_message "WARN" "Removed $stub_count partial/stub files."
+
+        # Count real files
+        local final_count=0
+        final_count=$(find "$output_dir" -name '*.mp3' -type f -size +100k -print0 2>/dev/null | tr '\0\n' | wc -l)
+
+        echo
+        if [ "$dl_rc" -eq 0 ] || [ "$dl_rc" -eq 101 ]; then
+          log_message "SUCCESS" "Sounds Like download complete! 🎉 ${BOLD}${YELLOW}$final_count${RESET}${GREEN} tracks saved." "${BOLD}${YELLOW}"
+          echo -e "\n${BOLD}${GREEN}✅ Tracks saved to:${RESET}"
+          echo -e "${BOLD}${CYAN}$output_dir${RESET}"
+        else
+          log_message "WARN" "Download finished with exit code $dl_rc. ${BOLD}${YELLOW}$final_count${RESET}${YELLOW} tracks saved." "${BOLD}${YELLOW}"
+          echo -e "\n${BOLD}${YELLOW}⚠️  Download had some issues, but files are in:${RESET}"
+          echo -e "${BOLD}${CYAN}$output_dir${RESET}"
+        fi
+        ;;
+
+      # ======================================================================
+      #  DISCOGRAPHY MODE (default)
+      # ======================================================================
+      *)
+        echo
+        log_message "INFO" "Mode: ${BOLD}${YELLOW}Discography${RESET}"
+
+        # Try the /tracks endpoint first (artist's own uploads)
+        local tracks_url="${clean_url}/tracks"
+        local sc_tracks_json
+        local track_count=0
+
+        echo -ne "${YELLOW}Fetching track list...${RESET} "
+        sc_tracks_json=$(yt-dlp --flat-playlist --dump-json -- "$tracks_url" 2>/dev/null)
+        track_count=$(echo "$sc_tracks_json" | grep -c .)
+
+        # Fallback: if /tracks returns nothing, try the main profile URL
+        if [ "$track_count" -eq 0 ]; then
+          echo -ne "\r${YELLOW}/tracks gave 0 results, trying profile URL instead...${RESET} "
+          tracks_url="$clean_url"
+          sc_tracks_json=$(yt-dlp --flat-playlist --dump-json -- "$tracks_url" 2>/dev/null)
+          track_count=$(echo "$sc_tracks_json" | grep -c .)
+        fi
+
+        if [ "$track_count" -eq 0 ]; then
+          echo -e "\r${RED}No tracks found.${RESET}"
+          log_message "ERROR" "Could not find any tracks for $artist_name. The profile may be empty."
+          return 1
+        fi
+        echo -e "\r${GREEN}Found ${CYAN}$track_count${RESET}${GREEN} track(s).${RESET}"
+
+        # Check for albums/playlists (sets) — stretch goal the user asked for
+        local sets_url="${clean_url}/sets"
+        local album_count=0
+        echo -ne "${YELLOW}Checking for albums/playlists...${RESET} "
+        album_count=$(yt-dlp --flat-playlist --print "%(title)s" -- "$sets_url" 2>/dev/null | grep -c .)
+        if [ "$album_count" -gt 0 ]; then
+          echo -e "\r${GREEN}Found ${CYAN}$album_count${RESET}${GREEN} album(s)/playlist(s). Albums will go in sub-folders.${RESET}"
+        else
+          echo -e "\r${GREEN}No albums found — all tracks will be singles in one folder.${RESET}"
+        fi
+
+        # Folder name with confirmation
+        local default_folder="$artist_name - Discography"
+        local sanitized_folder
+        sanitized_folder=$(sanitize_filename "$default_folder")
+        local output_dir="$BASE_MUSIC_DIR/$sanitized_folder"
+
+        echo
+        echo -e "${BOLD}${MAGENTA}📁 Output Location 📁${RESET}"
+        echo -e "Suggested folder: ${CYAN}$output_dir${RESET}"
+        echo -e "${YELLOW}Press Enter to accept, or type a different folder name:${RESET}"
+        read -p "$(echo -e "${CYAN}> ${RESET}")" folder_override
+        if [ -n "$folder_override" ]; then
+          sanitized_folder=$(sanitize_filename "$folder_override")
+          output_dir="$BASE_MUSIC_DIR/$sanitized_folder"
+        fi
+
+        mkdir -p "$output_dir" || { log_message "ERROR" "Could not create output directory '$output_dir'."; return 1; }
+
+        # ----- Download all tracks from /tracks (singles + album tracks) -----
+        echo
+        log_message "INFO" "Downloading ${CYAN}$track_count${RESET} tracks → ${CYAN}$output_dir${RESET}"
+        local output_template="$output_dir/%(playlist_index)02d - %(title)s.%(ext)s"
+
+        yt-dlp -f bestaudio -x --audio-format mp3 --audio-quality 0 \
+          --embed-metadata --add-metadata --embed-thumbnail \
+          --download-archive "$ARCHIVE_FILE" --no-overwrites \
+          --retries 30 \
+          -o "$output_template" -- "$tracks_url"
+        local dl_rc=$?
+
+        # Remove stub files under 100 KB
+        local stub_count=0
+        while IFS= read -r -d '' stub_file; do
+          rm -f "$stub_file"
+          ((stub_count++))
+        done < <(find "$output_dir" -name '*.mp3' -type f -size -100k -print0 2>/dev/null)
+        [ "$stub_count" -gt 0 ] && log_message "WARN" "Removed $stub_count partial/stub files."
+
+        # ----- Download each album / set into its own sub-folder -----
+        if [ "$album_count" -gt 0 ]; then
+          echo
+          echo -e "${YELLOW}Downloading albums/playlists into sub-folders...${RESET}"
+          local album_url album_title sanitized_album album_dir album_template
+          while IFS= read -r album_url; do
+            [ -z "$album_url" ] && continue
+            # Get the album/set title
+            album_title=$(yt-dlp --flat-playlist --print "%(playlist_title)s" -- "$album_url" 2>/dev/null | head -1)
+            sanitized_album=$(sanitize_filename "$album_title")
+            [ -z "$sanitized_album" ] && sanitized_album="album_$(date +%s)"
+            album_dir="$output_dir/$sanitized_album"
+            mkdir -p "$album_dir"
+
+            log_message "INFO" "Downloading album: ${CYAN}$album_title${RESET} → ${CYAN}$album_dir${RESET}"
+            album_template="$album_dir/%(playlist_index)02d - %(title)s.%(ext)s"
+            yt-dlp -f bestaudio -x --audio-format mp3 --audio-quality 0 \
+              --embed-metadata --add-metadata --embed-thumbnail \
+              --download-archive "$ARCHIVE_FILE" --no-overwrites \
+              --retries 30 \
+              -o "$album_template" -- "$album_url"
+
+            # Also clean up stubs in album sub-folders
+            while IFS= read -r -d '' stub_file; do
+              rm -f "$stub_file"
+            done < <(find "$album_dir" -name '*.mp3' -type f -size -100k -print0 2>/dev/null)
+          done < <(yt-dlp --flat-playlist --print url -- "$sets_url" 2>/dev/null)
+        fi
+
+        # Count final mp3 files over 100 KB across all sub-folders
+        local final_count=0
+        final_count=$(find "$output_dir" -name '*.mp3' -type f -size +100k -print0 2>/dev/null | tr '\0\n' | wc -l)
+
+        echo
+        if [ "$dl_rc" -eq 0 ] || [ "$dl_rc" -eq 101 ]; then
+          log_message "SUCCESS" "Discography download complete! 🎉 ${BOLD}${YELLOW}$final_count${RESET}${GREEN} tracks saved." "${BOLD}${YELLOW}"
+          [ "$album_count" -gt 0 ] && log_message "INFO" "Includes ${BOLD}${YELLOW}$album_count${RESET}${GREEN} album(s) in sub-folders." "${BOLD}${YELLOW}"
+          echo -e "\n${BOLD}${GREEN}✅ Tracks saved to:${RESET}"
+          echo -e "${BOLD}${CYAN}$output_dir${RESET}"
+        else
+          log_message "WARN" "Download finished with exit code $dl_rc. ${BOLD}${YELLOW}$final_count${RESET}${YELLOW} tracks saved." "${BOLD}${YELLOW}"
+          [ "$album_count" -gt 0 ] && log_message "INFO" "Includes ${BOLD}${YELLOW}$album_count${RESET}${YELLOW} album(s) in sub-folders." "${BOLD}${YELLOW}"
+          echo -e "\n${BOLD}${YELLOW}⚠️  Download had some issues, but files are in:${RESET}"
+          echo -e "${BOLD}${CYAN}$output_dir${RESET}"
+        fi
+        ;;
+    esac
+
+    return 0
   fi
 
   # --- Regular Playlist/Single Video Check (if not a SoundCloud User Profile) ---
