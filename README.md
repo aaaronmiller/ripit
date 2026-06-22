@@ -1,5 +1,13 @@
 # Ripit!
 
+<p>
+<img src="https://img.shields.io/badge/Bash-4EAA25?style=flat-square&logo=gnubash&logoColor=white">
+<img src="https://img.shields.io/badge/yt--dlp-FF0000?style=flat-square&logo=youtube&logoColor=white">
+<img src="https://img.shields.io/badge/ffmpeg-007808?style=flat-square&logo=ffmpeg&logoColor=white">
+</p>
+
+<img src="ripit%21%20skin1.jpeg" alt="Ripit screenshot" width="640">
+
 Ripit! is a Bash script to download and split YouTube audio into individual tracks using chapters, timestamped descriptions, or silence detection. It automates audio extraction and splitting for easy archiving and listening.
 
 ---
