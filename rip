@@ -1,0 +1,227 @@
+#!/usr/bin/env zsh
+#
+# rip — Zsh wrapper for ripit.sh with automatic dependency installation.
+#
+# Detects missing dependencies and installs them using the best available
+# package manager. Package manager fallback chain for JS tools:
+#   pnpm → npm → bun
+#
+# Usage:
+#   rip [options] <url|file.json>
+#   rip -i <file_or_dir>          # Identify unknown tracks
+#   rip --install-deps            # Only install deps, don't run
+#   rip --check                   # Check deps and report status
+#
+# Source this in ~/.zshrc or run directly.
+
+# --- Configuration ---
+RIPIT_DIR="${0:A:h}"  # Directory where this script lives
+RIPIT_SCRIPT="$RIPIT_DIR/ripit.sh"
+
+# Dependencies: name → install commands (tried in order)
+# For Python libs like shazamio, use a special check function
+typeset -A DEPS
+typeset -A DEP_CHECK
+DEPS=(
+  yt-dlp   "pip3 install yt-dlp"
+  ffmpeg   "sudo apt-get install -y ffmpeg; brew install ffmpeg"
+  jq       "sudo apt-get install -y jq; brew install jq"
+  spotdl   "pip3 install spotdl"
+  shazamio "pip3 install shazamio"
+)
+DEP_CHECK=(
+  shazamio 'python3 -c "import shazamio"'  # library, not CLI
+)
+
+# Colors
+R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; C='\033[0;36m'; B='\033[1m'; N='\033[0m'
+
+# --- Helper: check if a command exists ---
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# --- Helper: run with fallback ---
+# Tries each command in order until one succeeds.
+try_install() {
+  local dep_name="$1"
+  shift
+  local cmds=("$@")
+  local last_rc=1
+
+  for cmd in "${cmds[@]}"; do
+    # Split on semicolons for compound commands (brew fallback for apt)
+    local parts=("${(s/;/)cmd}")
+    local first_part="${parts[1]}"
+    local first_cmd="${first_part%% *}"
+
+    # Check if this command's package manager is available
+    if ! has_cmd "${first_cmd%% *}" && [[ "$first_cmd" != "pip3" ]]; then
+      continue
+    fi
+
+    echo -e "${YELLOW}  → Trying: $cmd${RESET}"
+    eval "$cmd" 2>/dev/null
+    last_rc=$?
+
+    if [[ $last_rc -eq 0 ]]; then
+      return 0
+    fi
+  done
+
+  return $last_rc
+}
+
+# --- Install a single dependency ---
+install_dep() {
+  local dep_name="$1"
+  local install_cmds="${DEPS[$dep_name]:-}"
+
+  if [[ -z "$install_cmds" ]]; then
+    echo -e "${R}No install command configured for: $dep_name${N}"
+    return 1
+  fi
+
+  # Parse install commands (semicolon-separated fallbacks)
+  local cmds=("${(s/;/)install_cmds}")
+
+  echo -e "${C}Installing ${B}$dep_name${N}...${N}"
+
+  if try_install "$dep_name" "${cmds[@]}"; then
+    echo -e "${G}✅ $dep_name installed${N}"
+    return 0
+  else
+    echo -e "${R}❌ Failed to install $dep_name${N}"
+    return 1
+  fi
+}
+
+# --- Check if a single dependency is satisfied ---
+dep_is_ok() {
+  local dep="$1"
+  # Check if there's a custom check function
+  local check_cmd="${DEP_CHECK[$dep]:-}"
+  if [[ -n "$check_cmd" ]]; then
+    eval "$check_cmd" 2>/dev/null && return 0 || return 1
+  fi
+  has_cmd "$dep"
+}
+
+# --- Check all dependencies ---
+check_deps() {
+  local all_ok=true
+  local missing=()
+
+  for dep in "${(@k)DEPS}"; do
+    if dep_is_ok "$dep"; then
+      echo -e "${G}✅ $dep${N}"
+    else
+      echo -e "${R}❌ $dep${N}"
+      missing+=("$dep")
+      all_ok=false
+    fi
+  done
+
+  # Check Python identify_track.py helper
+  if [[ -f "$RIPIT_DIR/identify_track.py" ]]; then
+    echo -e "${G}✅ identify_track.py${N}"
+  fi
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo -e "\n${Y}Missing: ${missing[*]}${N}"
+  fi
+
+  if $all_ok; then
+    echo -e "\n${G}${B}All dependencies satisfied${N}"
+  fi
+
+  $all_ok; return $?
+}
+
+# --- Auto-install all missing dependencies ---
+auto_install() {
+  local missing=()
+  for dep in "${(@k)DEPS}"; do
+    if ! dep_is_ok "$dep"; then
+      missing+=("$dep")
+    fi
+  done
+
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    echo -e "${G}${B}All dependencies already installed!${N}"
+    return 0
+  fi
+
+  echo -e "${Y}Missing dependencies: ${missing[*]}${N}"
+  echo -e "${C}Auto-installing...${N}\n"
+
+  local failed=()
+  for dep in "${missing[@]}"; do
+    install_dep "$dep" || failed+=("$dep")
+  done
+
+  if [[ ${#failed[@]} -gt 0 ]]; then
+    echo -e "\n${R}❌ Failed to install: ${failed[*]}${N}"
+    echo -e "${Y}Try installing manually:${N}"
+    for dep in "${failed[@]}"; do
+      echo -e "  ${C}${DEPS[$dep]}${N}"
+    done
+    return 1
+  fi
+
+  echo -e "\n${G}${B}✅ All dependencies installed!${N}"
+  return 0
+}
+
+# --- Main ---
+main() {
+  local args=("$@")
+
+  # Handle special flags
+  if [[ "${args[1]}" == "--check" ]]; then
+    check_deps
+    return $?
+  fi
+
+  if [[ "${args[1]}" == "--install-deps" ]]; then
+    auto_install
+    return $?
+  fi
+
+  # Check deps first, offer to install if missing
+  local missing=false
+  for dep in "${(@k)DEPS}"; do
+    if ! dep_is_ok "$dep"; then
+      missing=true
+      break
+    fi
+  done
+
+  if $missing; then
+    echo -e "${Y}⚠️  Some dependencies are missing.${N}"
+    echo -ne "${C}Auto-install them? [Y/n] ${N}"
+    read -q reply
+    echo
+    if [[ "$reply" != "n" ]]; then
+      auto_install || echo -e "${Y}⚠️  Continuing with missing deps (some features may not work)${N}"
+    fi
+  fi
+
+  # Run ripit.sh
+  if [[ ! -x "$RIPIT_SCRIPT" ]]; then
+    echo -e "${R}❌ ripit.sh not found or not executable at: $RIPIT_SCRIPT${N}"
+    return 1
+  fi
+
+  echo -e "${C}━━━ Running ripit.sh ━━━${N}\n"
+  bash "$RIPIT_SCRIPT" "${args[@]}"
+  local rc=$?
+
+  if [[ $rc -eq 0 ]]; then
+    echo -e "\n${G}${B}✅ Done!${N}"
+  else
+    echo -e "\n${R}ripit.sh exited with code $rc${N}"
+  fi
+
+  return $rc
+}
+
+main "$@"

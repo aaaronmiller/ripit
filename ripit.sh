@@ -48,7 +48,7 @@ cat <<'EOF'
          \_______) |__|  \___)(___/    \___)(_______/ (_______/  \_______)|__|  \___)(_____/
 EOF
 echo -e "${RESET}"
-echo -e "${BOLD}${GREEN}🎵 YouTube Audio Ripper & Track Splitter 🎵${RESET}"
+echo -e "${BOLD}${GREEN}🎵 Multi-Site Audio Ripper & Track Splitter 🎵${RESET}"
 echo -e "${CYAN}$(date '+%Y-%m-%d %H:%M:%S')${RESET}"
 echo
 
@@ -301,35 +301,433 @@ show_progress() {
   fi
 }
 
+# --- Identify Unknown Audio Tracks (Shazam via shazamio) ---
+# Uses identify_track.py (Python/shasamio) to fingerprint unknown audio files.
+# Retries at different offsets (0s, 30s, 60s, 90s) if the first attempt fails.
+identify_unknown_track() {
+  local audio_file="$1"
+  local label="${2:-$(basename "$audio_file")}"
+  local basename dirname
+  basename=$(basename "$audio_file")
+  dirname=$(dirname "$audio_file")
+
+  if [ ! -f "$audio_file" ]; then
+    log_message "ERROR" "File not found: $audio_file"
+    return 1
+  fi
+
+  local file_size
+  file_size=$(stat -c%s "$audio_file" 2>/dev/null || stat -f%z "$audio_file" 2>/dev/null)
+  if [ -z "$file_size" ] || [ "$file_size" -lt 4096 ]; then
+    log_message "WARN" "File too small to identify: $basename"
+    return 1
+  fi
+
+  # Find the Python helper alongside this script
+  local helper_dir
+  helper_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local helper="$helper_dir/identify_track.py"
+  if [ ! -f "$helper" ]; then
+    log_message "ERROR" "identify_track.py not found alongside ripit.sh"
+    return 1
+  fi
+
+  # Get track duration to avoid skipping past the end
+  local track_duration
+  track_duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$audio_file" 2>/dev/null)
+  track_duration=${track_duration%.*}
+  track_duration=${track_duration:-0}
+
+  # Retry offsets: 0s, 30s, 60s, 90s
+  local offsets=(0 30 60 90)
+  local offset
+  for offset in "${offsets[@]}"; do
+    # Skip if offset exceeds track duration
+    if [ "$offset" -gt 0 ] && [ "$track_duration" -gt 0 ] && [ "$offset" -ge "$track_duration" ]; then
+      log_message "DEBUG" "Skipping offset ${offset}s — file too short (${track_duration}s)"
+      continue
+    fi
+
+    log_message "INFO" "Identifying: ${label} (attempt at +${offset}s)..."
+
+    local result
+    result=$(python3 "$helper" "$audio_file" --offset "$offset" 2>/dev/null)
+
+    local success
+    success=$(echo "$result" | python3 -c "import json,sys; d=json.load(sys.stdin); print('true' if d.get('success') else 'false')" 2>/dev/null)
+
+    if [ "$success" = "true" ]; then
+      local title artist
+      title=$(echo "$result" | python3 -c "import json,sys; print(json.load(sys.stdin).get('title',''))" 2>/dev/null)
+      artist=$(echo "$result" | python3 -c "import json,sys; print(json.load(sys.stdin).get('artist',''))" 2>/dev/null)
+
+      log_message "SUCCESS" "✅ Identified: ${CYAN}$title${RESET} by ${YELLOW}$artist${RESET}"
+
+      # Rename the file — preserve track number prefix if present
+      local new_name
+      local prefix=""
+      if [[ "$basename" =~ ^([0-9]+\ -\ ) ]]; then
+        prefix="${BASH_REMATCH[1]}"
+      fi
+
+      local safe_title safe_artist
+      safe_title=$(sanitize_filename "$title")
+      safe_artist=$(sanitize_filename "$artist")
+      new_name="${prefix}${safe_title} - ${safe_artist}.mp3"
+
+      if [ "$new_name" != "$basename" ]; then
+        mv "$audio_file" "$dirname/$new_name"
+        log_message "SUCCESS" "Renamed: ${CYAN}$basename${RESET} → ${GREEN}$new_name${RESET}"
+      fi
+      return 0
+    fi
+
+    sleep 2
+  done
+
+  log_message "WARN" "Could not identify: $basename (tried offsets: ${offsets[*]})"
+  return 1
+}
+
+# Identify all unknown tracks in a directory
+identify_unknown_tracks_in_dir() {
+  local dir="$1"
+  local count=0
+  local identified=0
+
+  if [ ! -d "$dir" ]; then
+    log_message "ERROR" "Directory not found: $dir"
+    return 1
+  fi
+
+  log_message "INFO" "Scanning for unknown tracks in: ${CYAN}$dir${RESET}"
+
+  local mp3_file
+  while IFS= read -r -d '' mp3_file; do
+    local basename
+    basename=$(basename "$mp3_file")
+    ((count++))
+
+    echo -ne "${YELLOW}[$count] Identifying: $basename...${RESET}\r"
+
+    if identify_unknown_track "$mp3_file" "$basename"; then
+      ((identified++))
+    fi
+  done < <(find "$dir" -name '*.mp3' -type f -size +100k -print0 2>/dev/null)
+
+  echo
+  log_message "SUCCESS" "Identification complete: ${CYAN}$identified${RESET}/${CYAN}$count${RESET} tracks identified"
+}
+
+# --- JSON Input Processing ---
+# Processes a JSON file with artist/album/singles/cameos structure.
+# Auto-detected when the argument ends in .json
+process_json_input() {
+  local json_file="$1"
+
+  # Security: reject path traversal
+  if [[ "$json_file" == *".."* ]]; then
+    log_message "ERROR" "Invalid JSON file path (path traversal detected): $json_file"
+    return 1
+  fi
+
+  # Validate JSON structure with jq — safe parsing, no eval
+  if ! jq -e '.artists' "$json_file" >/dev/null 2>&1; then
+    log_message "ERROR" "Invalid JSON: missing required '.artists' array"
+    log_message "INFO" "Expected structure: { \"version\": \"1.0\", \"break\": 2, \"artists\": [...] }"
+    return 1
+  fi
+
+  # Get top-level break value (in minutes)
+  local break_minutes=0
+  break_minutes=$(jq -r '.break // 0' "$json_file")
+  if ! [[ "$break_minutes" =~ ^[0-9]+$ ]]; then
+    break_minutes=0
+  fi
+
+  local json_version
+  json_version=$(jq -r '.version // "1.0"' "$json_file")
+
+  echo -e "\n${BOLD}${MAGENTA}📦 JSON BATCH PROCESSING 📦${RESET}"
+  log_message "SUCCESS" "Loaded JSON v${json_version}: ${CYAN}$(jq '.artists | length' "$json_file")${RESET} artist(s)"
+  if (( break_minutes > 0 )); then
+    log_message "INFO" "Album break: ${CYAN}$break_minutes${RESET} minute(s) between each album"
+  fi
+
+  # ---- Adaptive rate limiter state ----
+  # Tracks success/failure per domain and adjusts delay dynamically.
+  # No hard-coded quotas — it learns from observed HTTP errors / rate limits.
+  declare -A DOMAIN_SUCCESS DOMAIN_FAILURE DOMAIN_DELAY
+
+  # Helper: extract domain from URL
+  get_domain() {
+    local url="$1"
+    echo "$url" | awk -F/ '{print $3}'
+  }
+
+  # Helper: update rate limiter based on exit code
+  update_rate_limiter() {
+    local domain="$1"
+    local exit_code="$2"
+    if [[ "$exit_code" -eq 0 ]] || [[ "$exit_code" -eq 101 ]]; then
+      # Success — gradually reduce delay
+      DOMAIN_SUCCESS["$domain"]=$(( ${DOMAIN_SUCCESS["$domain"]:-0} + 1 ))
+      if (( ${DOMAIN_SUCCESS["$domain"]} % 3 == 0 )) && (( ${DOMAIN_DELAY["$domain"]:-0} > 0 )); then
+        DOMAIN_DELAY["$domain"]=$(( DOMAIN_DELAY["$domain"] - 1 ))
+      fi
+    else
+      # Failure — increase delay (exponential backoff)
+      DOMAIN_FAILURE["$domain"]=$(( ${DOMAIN_FAILURE["$domain"]:-0} + 1 ))
+      local cur_delay=${DOMAIN_DELAY["$domain"]:-1}
+      DOMAIN_DELAY["$domain"]=$(( cur_delay * 2 + 1 ))
+      if (( ${DOMAIN_DELAY["$domain"]} > 120 )); then
+        DOMAIN_DELAY["$domain"]=120  # cap at 2 min
+      fi
+    fi
+  }
+
+  # Helper: wait according to rate limiter
+  rate_limit_wait() {
+    local domain="$1"
+    local delay=${DOMAIN_DELAY["$domain"]:-0}
+    if (( delay > 0 )); then
+      log_message "INFO" "Rate limiter: waiting ${CYAN}${delay}s${RESET} for domain ${YELLOW}$domain${RESET}"
+      sleep "$delay"
+    fi
+  }
+
+  # Helper: download a single track/playlist URL with rate limiting
+  download_track() {
+    local url="$1"
+    local output_path="$2"
+    local label="$3"
+    local domain
+    domain=$(get_domain "$url")
+
+    rate_limit_wait "$domain"
+
+    log_message "INFO" "Downloading: ${CYAN}$label${RESET} ← ${YELLOW}$url${RESET}"
+
+    local rc=0
+    yt-dlp -f bestaudio -x --audio-format mp3 --audio-quality 0 \
+      --embed-metadata --add-metadata --embed-thumbnail \
+      --no-overwrites --retries 5 --retry-sleep 10 \
+      -o "$output_path" -- "$url" 2>&1
+    rc=$?
+
+    update_rate_limiter "$domain" "$rc"
+    return $rc
+  }
+
+  # ---- Process each artist ----
+  local artist_count
+  artist_count=$(jq '.artists | length' "$json_file")
+
+  for (( a=0; a<artist_count; a++ )); do
+    local artist_name
+    artist_name=$(jq -r ".artists[$a].name // \"Unknown_Artist_$a\"" "$json_file")
+    local sanitized_artist
+    sanitized_artist=$(sanitize_filename "$artist_name")
+    local artist_dir="$BASE_MUSIC_DIR/$sanitized_artist"
+
+    CURRENT_LOG_CONTEXT="$artist_name"
+    echo -e "\n${BOLD}${CYAN}━━━ Artist: $artist_name ━━━${RESET}"
+    log_message "SUCCESS" "Processing artist: ${CYAN}$artist_name${RESET}"
+    mkdir -p "$artist_dir"
+
+    # ----- Process Albums (in order) -----
+    local album_count
+    album_count=$(jq ".artists[$a].albums | length" "$json_file")
+
+    for (( b=0; b<album_count; b++ )); do
+      local album_title album_url
+      album_title=$(jq -r ".artists[$a].albums[$b].title // \"Album_$b\"" "$json_file")
+      album_url=$(jq -r ".artists[$a].albums[$b].url // \"\"" "$json_file")
+      local sanitized_album
+      sanitized_album=$(sanitize_filename "$album_title")
+      local album_dir="$artist_dir/$sanitized_album"
+
+      CURRENT_LOG_CONTEXT="$artist_name - $album_title"
+
+      echo -e "\n${BOLD}${MAGENTA}💿 Album: $album_title${RESET}"
+      log_message "INFO" "Processing album: ${CYAN}$album_title${RESET}"
+      mkdir -p "$album_dir"
+
+      # Read skip list (1-based track indices)
+      local skip_indices=()
+      while IFS= read -r skip_idx; do
+        skip_indices+=("$skip_idx")
+      done < <(jq -r ".artists[$a].albums[$b].skip[]" "$json_file" 2>/dev/null)
+
+      # Read tracks array
+      local track_count
+      track_count=$(jq ".artists[$a].albums[$b].tracks | length" "$json_file")
+
+      log_message "INFO" "${CYAN}$track_count${RESET} tracks, skip indices: ${YELLOW}${skip_indices[*]:-(none)}${RESET}"
+
+      # Download the album playlist URL
+      if [[ -n "$album_url" ]]; then
+        local album_output_template="$album_dir/%(playlist_index)02d - %(title)s.%(ext)s"
+
+        download_track "$album_url" "$album_output_template" "Album: $album_title"
+        local dl_rc=$?
+
+        # After download completes: excise (remove) tracks matching skip list
+        if [[ ${#skip_indices[@]} -gt 0 ]] && [[ -d "$album_dir" ]]; then
+          log_message "INFO" "Excising ${#skip_indices[@]} skipped track(s) from album..."
+          local removed_count=0
+          while IFS= read -r -d '' mp3_file; do
+            local basename
+            basename=$(basename "$mp3_file")
+            local track_num
+            track_num=$(echo "$basename" | grep -oP '^\d+' || echo "0")
+            track_num=$((10#$track_num))
+            for skip_idx in "${skip_indices[@]}"; do
+              if (( track_num == skip_idx )); then
+                log_message "INFO" "  ✂️  Removing skipped track #$track_num: $basename"
+                rm -f "$mp3_file"
+                ((removed_count++))
+                break
+              fi
+            done
+          done < <(find "$album_dir" -name '*.mp3' -type f -size +50k -print0 2>/dev/null)
+          log_message "SUCCESS" "Excised ${CYAN}$removed_count${RESET} skipped track(s) from '${CYAN}$album_title${RESET}'"
+        fi
+
+        # Count remaining files
+        local remaining
+        remaining=$(find "$album_dir" -name '*.mp3' -type f -size +50k 2>/dev/null | wc -l)
+        log_message "SUCCESS" "Album '${CYAN}$album_title${RESET}' done — ${CYAN}$remaining${RESET} tracks → ${YELLOW}$album_dir${RESET}"
+
+      else
+        log_message "WARN" "No URL for album '$album_title' — track listing only, nothing to download"
+      fi
+
+      # ---- Pause (break) between albums ----
+      if (( break_minutes > 0 )); then
+        local break_seconds=$((break_minutes * 60))
+        echo
+        log_message "INFO" "⏸️  Break: pausing for ${CYAN}$break_minutes${RESET} minute(s)..."
+        for (( s=break_seconds; s>0; s-=10 )); do
+          echo -ne "${YELLOW}⏸️  Resuming in ${s}s...${RESET}\r"
+          sleep 10
+        done
+        echo
+        log_message "INFO" "Break done, resuming..."
+      fi
+    done
+
+    # ----- Process Singles (all together in one folder) -----
+    if jq -e ".artists[$a].singles" "$json_file" >/dev/null 2>&1; then
+      local singles_count
+      singles_count=$(jq ".artists[$a].singles | length" "$json_file")
+      if (( singles_count > 0 )); then
+        local singles_dir="$artist_dir/singles"
+        mkdir -p "$singles_dir"
+        echo -e "\n${BOLD}${GREEN}🎵 Singles ($singles_count)${RESET}"
+        log_message "INFO" "Processing ${CYAN}$singles_count${RESET} single(s) → ${YELLOW}$singles_dir${RESET}"
+
+        for (( s=0; s<singles_count; s++ )); do
+          local single_title single_url
+          single_title=$(jq -r ".artists[$a].singles[$s].title // .artists[$a].singles[$s] | values" "$json_file")
+          single_url=$(jq -r ".artists[$a].singles[$s].url // \"\"" "$json_file")
+          local sanitized_single
+          sanitized_single=$(sanitize_filename "$single_title")
+
+          if [[ -n "$single_url" ]]; then
+            CURRENT_LOG_CONTEXT="$artist_name - Single: $single_title"
+            download_track "$single_url" "$singles_dir/$sanitized_single.%(ext)s" "$single_title"
+          else
+            log_message "WARN" "No URL for single '$single_title' — skipping"
+          fi
+
+          # Rate-adaptive pause between individual singles
+          if (( s < singles_count - 1 )); then
+            local single_domain
+            single_domain=$(get_domain "$single_url")
+            rate_limit_wait "$single_domain"
+          fi
+        done
+        CURRENT_LOG_CONTEXT="$artist_name"
+      fi
+    fi
+
+    # ----- Process Cameos (all together in one folder) -----
+    if jq -e ".artists[$a].cameos" "$json_file" >/dev/null 2>&1; then
+      local cameos_count
+      cameos_count=$(jq ".artists[$a].cameos | length" "$json_file")
+      if (( cameos_count > 0 )); then
+        local cameos_dir="$artist_dir/cameos"
+        mkdir -p "$cameos_dir"
+        echo -e "\n${BOLD}${YELLOW}🎤 Cameos ($cameos_count)${RESET}"
+        log_message "INFO" "Processing ${CYAN}$cameos_count${RESET} cameo(s) → ${YELLOW}$cameos_dir${RESET}"
+
+        for (( c=0; c<cameos_count; c++ )); do
+          local cameo_title cameo_url
+          cameo_title=$(jq -r ".artists[$a].cameos[$c].title // .artists[$a].cameos[$c] | values" "$json_file")
+          cameo_url=$(jq -r ".artists[$a].cameos[$c].url // \"\"" "$json_file")
+          local sanitized_cameo
+          sanitized_cameo=$(sanitize_filename "$cameo_title")
+
+          if [[ -n "$cameo_url" ]]; then
+            CURRENT_LOG_CONTEXT="$artist_name - Cameo: $cameo_title"
+            download_track "$cameo_url" "$cameos_dir/$sanitized_cameo.%(ext)s" "$cameo_title"
+          else
+            log_message "WARN" "No URL for cameo '$cameo_title' — skipping"
+          fi
+
+          if (( c < cameos_count - 1 )); then
+            local cameo_domain
+            cameo_domain=$(get_domain "$cameo_url")
+            rate_limit_wait "$cameo_domain"
+          fi
+        done
+        CURRENT_LOG_CONTEXT="$artist_name"
+      fi
+    fi
+  done
+
+  echo -e "\n${BOLD}${GREEN}✅ JSON batch processing complete! 🎉${RESET}"
+  echo
+  return 0
+}
+
 
 # --- Main Rip Function ---
 rip() {
   # Usage/help function with colors
   usage() {
     cat <<EOF >&2
-${BOLD}${GREEN}Usage:${RESET} $0 ${YELLOW}[options]${RESET} ${CYAN}<youtube_url_or_id>${RESET}
+${BOLD}${GREEN}Usage:${RESET} $0 ${YELLOW}[options]${RESET} ${CYAN}<url | file.json>${RESET}
 
 ${BOLD}${GREEN}Description:${RESET}
-  Downloads audio from a YouTube URL (video or playlist).
+  Downloads audio from 1872+ sites (YouTube, SoundCloud, Bandcamp, Vimeo,
+  Twitch, TikTok, Mixcloud, and more via yt-dlp + spotDL for Spotify).
   For single videos, attempts to split into tracks using Chapters,
   Timestamped Description, or Silence Detection (in that order).
   For playlists, downloads each video as a separate MP3 file.
+  If a .json file provided, processes it as a batch music catalog.
 
 ${BOLD}${GREEN}Options:${RESET}
-  ${YELLOW}-o <dir>${RESET}      Specify output directory (default: ~/music/YTdownloads)
+  ${YELLOW}-o <dir>${RESET}      Output directory (default: ~/music/YTdownloads)
   ${YELLOW}-d <db>${RESET}       Silence detection threshold in dB (default: -30)
-                   Note: Provide only the number, e.g., -d -40
-  ${YELLOW}-s <sec>${RESET}      Minimum silence duration in seconds (default: 1)
-  ${YELLOW}-l <file>${RESET}     Log file path (optional, appends if exists)
+  ${YELLOW}-s <sec>${RESET}      Minimum silence duration (default: 1)
+  ${YELLOW}-l <file>${RESET}     Log file path (appends if exists)
+  ${YELLOW}-i <path>${RESET}     Identify unknown audio track(s) in a file or directory (uses Shazam)
   ${YELLOW}-h${RESET}             Show this help message
 
-${BOLD}${GREEN}Arguments:${RESET}
-  ${CYAN}youtube_url_or_id${RESET} YouTube video/playlist URL or ID (required)
+${BOLD}${GREEN}Input modes:${RESET}
+  ${CYAN}<url>${RESET}           Any supported site URL (YouTube, SoundCloud, Spotify, etc.)
+  ${CYAN}<file.json>${RESET}     Batch music catalog JSON file (auto-detected)
+  ${CYAN}-${RESET} (stdin pipe)  Read URL from stdin — bypasses zsh glob issues
 
 ${BOLD}${MAGENTA}Examples:${RESET}
-  ${WHITE}$0 https://www.youtube.com/watch?v=dQw4w9WgXcQ${RESET}
-  ${WHITE}$0 -o ~/Music/Mixes -d -35 -s 1.5 https://youtu.be/dQw4w9WgXcQ${RESET}
-  ${WHITE}$0 PLpSRhk4sG0Wn5Hp-oOsd2QGMXipry3-rw ${RESET}# Playlist ID example
+  ${WHITE}$0 "https://www.youtube.com/watch?v=dQw4w9WgXcQ"${RESET}
+  ${WHITE}$0 -o ~/Music -d -35 -s 1.5 "https://youtu.be/dQw4w9WgXcQ"${RESET}
+  ${WHITE}$0 https://soundcloud.com/artistname${RESET}
+  ${WHITE}$0 "https://open.spotify.com/album/..."${RESET}   # requires spotDL
+  ${WHITE}$0 example_schema.json${RESET}                   # batch mode
+  ${WHITE}echo "https://youtu.be/..." | $0 -${RESET}       # stdin (zsh-safe)
 EOF
   }
 
@@ -342,12 +740,13 @@ EOF
   local LOG_FILE="" # Initialize, might be set by -l
 
   # Use getopts for robust option parsing
-  while getopts ":o:d:s:l:h" opt; do
+  while getopts ":o:d:s:l:i:h" opt; do
     case $opt in
       o) BASE_MUSIC_DIR="$OPTARG" ;;
       d) SILENCE_DB="$OPTARG" ;;
       s) SILENCE_SEC="$OPTARG" ;;
       l) LOG_FILE="$OPTARG" ;; # Set LOG_FILE if -l is used
+      i) IDENTIFY_TARGET="$OPTARG" ;;
       h) usage; return 0 ;;
       \?) log_message "ERROR" "Invalid option: -$OPTARG"; usage; return 1 ;;
       :) log_message "ERROR" "Option -$OPTARG requires an argument."; usage; return 1 ;;
@@ -356,13 +755,99 @@ EOF
   shift $((OPTIND -1)) # Remove processed options
 
   # Check for mandatory URL/ID argument
+  local target_url=""
   if [ -z "$1" ]; then
-    log_message "ERROR" "No YouTube URL or Video/Playlist ID provided."
+    log_message "ERROR" "No URL or JSON file provided."
     usage
     return 1
+  elif [ "$1" = "-" ]; then
+    # Read URL from stdin — bypasses zsh glob interpretation of ? and &
+    IFS= read -r target_url
+    if [ -z "$target_url" ]; then
+      log_message "ERROR" "No URL provided via stdin."
+      return 1
+    fi
+    log_message "SUCCESS" "Read URL from stdin"
+    shift
+  else
+    target_url="$1"
+    shift # Consume the URL argument
   fi
-  local target_url="$1"
-  shift # Consume the URL argument
+
+  # --- Auto-detect JSON input ---
+  if [[ "$target_url" == *.json ]]; then
+    if [[ ! -f "$target_url" ]]; then
+      log_message "ERROR" "JSON file not found: $target_url"
+      return 1
+    fi
+    # Security: reject path traversal before processing
+    if [[ "$target_url" == *".."* ]]; then
+      log_message "ERROR" "Invalid JSON file path (path traversal detected): $target_url"
+      return 1
+    fi
+    log_message "SUCCESS" "Detected JSON input, switching to batch mode"
+    process_json_input "$target_url"
+    return $?
+  fi
+
+  # --- Auto-detect Spotify URLs → route to spotDL ---
+  if [[ "$target_url" == *"open.spotify.com"* ]]; then
+    if ! command -v spotdl >/dev/null 2>&1; then
+      log_message "ERROR" "spotDL is required for Spotify URLs but is not installed."
+      echo -e "\n${YELLOW}Install it:${RESET} pip install spotdl"
+      echo -e "${YELLOW}Then run:${RESET} $0 \"$target_url\""
+      return 1
+    fi
+
+    echo -e "\n${BOLD}${MAGENTA}🎵 SPOTIFY DOWNLOAD 🎵${RESET}"
+    log_message "SUCCESS" "Spotify URL detected, downloading via spotDL"
+
+    local spotdl_output=""
+    if [[ "$target_url" == *"/album/"* ]]; then
+      spotdl_output="$BASE_MUSIC_DIR/{artist}/{album}/{track-number} - {title}.{output-ext}"
+      log_message "INFO" "Detected Spotify album"
+    elif [[ "$target_url" == *"/playlist/"* ]]; then
+      spotdl_output="$BASE_MUSIC_DIR/{list-name}/{track-number} - {title}.{output-ext}"
+      log_message "INFO" "Detected Spotify playlist"
+    else
+      # Track or other: put in artist/singles/
+      spotdl_output="$BASE_MUSIC_DIR/{artist}/singles/{title}.{output-ext}"
+      log_message "INFO" "Detected Spotify track → artist/singles/ folder"
+    fi
+
+    log_message "INFO" "Output template: ${CYAN}$spotdl_output${RESET}"
+    log_message "INFO" "Starting spotDL download (this may take a while)..."
+
+    # spotDL finds matching audio from YouTube/MusiMatch and downloads
+    spotdl "$target_url" \
+      --output "$spotdl_output" \
+      --format mp3 \
+      --overwrite skip \
+      --print-errors
+    local spotdl_rc=$?
+
+    if [ "$spotdl_rc" -eq 0 ]; then
+      log_message "SUCCESS" "🎉 Spotify download complete!"
+    else
+      log_message "WARN" "spotDL finished with exit code $spotdl_rc (some tracks may have failed)."
+    fi
+
+    return $spotdl_rc
+  fi
+
+  # --- Identify mode (-i <path>) ---
+  if [ -n "${IDENTIFY_TARGET:-}" ]; then
+    if [ -f "$IDENTIFY_TARGET" ]; then
+      identify_unknown_track "$IDENTIFY_TARGET"
+    elif [ -d "$IDENTIFY_TARGET" ]; then
+      identify_unknown_tracks_in_dir "$IDENTIFY_TARGET"
+    else
+      log_message "ERROR" "Identify target not found: $IDENTIFY_TARGET"
+      return 1
+    fi
+    local identify_rc=$?
+    return $identify_rc
+  fi
 
   # Validate numeric options
   # *** FIX: Correct regex for decimal/integer validation ***
@@ -1189,6 +1674,13 @@ EOF
         rm -f "$downloaded_audio_file"
         echo -e "\n${BOLD}${GREEN}✅ Split complete! Your tracks are ready in:${RESET}"
         echo -e "${BOLD}${CYAN}$output_base_dir${RESET}"
+
+        # Auto-identify tracks with generic names (Track_001, Track_002, etc.)
+        if [ "$split_method" = "Silence Detection with Generic Titles" ]; then
+          echo -e "\n${BOLD}${MAGENTA}🔍 AUTO-IDENTIFYING UNKNOWN TRACKS 🔍${RESET}"
+          log_message "INFO" "Tracks have generic names — attempting Shazam identification"
+          identify_unknown_tracks_in_dir "$output_base_dir"
+        fi
       else
         log_message "ERROR" "Splitting failed for ${CYAN}$failed_splits${RESET} track(s). Keeping original audio file."
         echo -e "\n${BOLD}${YELLOW}⚠️ Splitting had errors. Original file preserved.${RESET}"

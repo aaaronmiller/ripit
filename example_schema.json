@@ -1,0 +1,44 @@
+{
+  "version": "1.0",
+  "break": 2,
+  "artists": [
+    {
+      "name": "Drake",
+      "albums": [
+        {
+          "title": "Take Care",
+          "year": 2011,
+          "url": "https://open.spotify.com/album/6X1x82kppWZmDzlXXK3y3q",
+          "skip": [1, 2, 4, 5, 6, 7, 12, 13, 17, 18],
+          "tracks": ["Over My Dead Body", "Shot For Me", "Headlines", "Crew Love", "Take Care", "Marvins Room", "Buried Alive Interlude", "Underground Kings", "We'll Be Fine", "Make Me Proud", "Lord Knows", "Cameras / Good Ones Go Interlude", "Doing It Wrong", "The Real Her", "Look What You've Done", "HYFR (Hell Ya Fucking Right)", "Practice", "The Motto"]
+        }
+      ],
+      "singles": [
+        {"title": "God's Plan", "url": "https://www.youtube.com/watch?v=xpVfcZ0ZcFM"},
+        {"title": "Hotline Bling", "url": "https://www.youtube.com/watch?v=uxpDa-c-4Mc"},
+        {"title": "One Dance", "url": "https://www.youtube.com/watch?v=iAbnEUA0wpA"}
+      ],
+      "cameos": [
+        {"title": "Sicko Mode (Drake feature)", "url": "https://www.youtube.com/watch?v=6ONRf7h3Mdk"},
+        {"title": "Life Is Good (Drake feature)", "url": "https://www.youtube.com/watch?v=l0U7SxXHkPY"}
+      ]
+    },
+    {
+      "name": "Cordae",
+      "albums": [
+        {
+          "title": "The Lost Boy",
+          "year": 2019,
+          "url": "https://open.spotify.com/album/6Pb7PMZtW0fuEM1lCGvCDu",
+          "skip": [],
+          "tracks": ["Wintertime", "Have Mercy", "We Gon Make It", "Broke as Fuck", "Been Around", "Lost & Found", "Family Matters", "Thanksgiving", "Nightmares Are Real", "RNP", "Old Roads", "Way Back Home"]
+        }
+      ],
+      "singles": [
+        {"title": "Sinister", "url": "https://www.youtube.com/watch?v=6S20mJpQp7o"},
+        {"title": "Two Tens", "url": "https://www.youtube.com/watch?v=9fBHfCxI7hA"}
+      ],
+      "cameos": []
+    }
+  ]
+}
