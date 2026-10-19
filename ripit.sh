@@ -509,7 +509,7 @@ process_json_input() {
     log_message "INFO" "Downloading: ${CYAN}$label${RESET} ← ${YELLOW}$url${RESET}"
 
     local rc=0
-    yt-dlp -f bestaudio -x --audio-format mp3 --audio-quality 0 \
+    yt-dlp --js-runtimes node -f bestaudio -x --audio-format mp3 --audio-quality 0 \
       --embed-metadata --add-metadata --embed-thumbnail \
       --no-overwrites --retries 5 --retry-sleep 10 \
       -o "$output_path" -- "$url" 2>&1
@@ -1323,6 +1323,14 @@ EOF
     --retries 30                     # Retry up to 30 times on errors
     # --socket-timeout 30            # Optional: Timeout for each network read (in seconds)
   )
+
+  # YouTube requires a JS runtime to solve JS challenges; without one the
+  # media URLs return HTTP 403. Prefer node, fall back to bun.
+  if command -v node >/dev/null 2>&1; then
+    ytdlp_opts+=(--js-runtimes node)
+  elif command -v bun >/dev/null 2>&1; then
+    ytdlp_opts+=(--js-runtimes bun)
+  fi
 
   # Add --no-playlist only if we positively identified a single video
   # If type was unknown (-1) or playlist (1), let yt-dlp default behavior handle it.
