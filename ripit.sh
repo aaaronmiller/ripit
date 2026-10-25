@@ -131,7 +131,7 @@ sanitize_filename() {
   # Limit length to 100 characters
   sanitized=${sanitized:0:100}
   # Remove trailing underscore after truncation
-  sanitized=$(echo "$sanitized" | sed 's/_$//')
+  sanitized=${sanitized%_}
   # Ensure not empty
   if [ -z "$sanitized" ]; then
     sanitized="untitled"
@@ -217,9 +217,9 @@ spinner() {
     local pid=$1
     local spin='-\|/'
     local i=0
-    while kill -0 $pid 2>/dev/null; do
+    while kill -0 "$pid" 2>/dev/null; do
         i=$(( (i+1) %4 ))
-        printf "\r${YELLOW}${spin:$i:1}${RESET}"
+        printf '\r%s%s%s' "$YELLOW" "${spin:$i:1}" "$RESET"
         sleep 0.1
     done
     printf "\r"
@@ -919,7 +919,7 @@ EOF
   if is_soundcloud_user_profile "$target_url"; then
     # Strip trailing slash and extract artist name from URL
     local clean_url
-    clean_url=$(echo "$target_url" | sed 's#/$##')
+    clean_url=${target_url%/}
     local artist_name
     artist_name=$(echo "$clean_url" | awk -F'/' '{print $NF}')
     local sanitized_artist
@@ -939,7 +939,7 @@ EOF
     echo
 
     local choice
-    read -p "$(echo -e "${CYAN}Enter choice (1/2) [1]: ${RESET}")" choice
+    read -r -p "$(echo -e "${CYAN}Enter choice (1/2) [1]: ${RESET}")" choice
     choice=${choice:-1}
 
     case "$choice" in
@@ -964,7 +964,7 @@ EOF
         # Ask how many to download (default 80)
         local limit=80
         echo
-        read -p "$(echo -e "${CYAN}How many songs to download? [${limit}]: ${RESET}")" limit_input
+        read -r -p "$(echo -e "${CYAN}How many songs to download? [${limit}]: ${RESET}")" limit_input
         limit=${limit_input:-80}
 
         # Folder name with confirmation
@@ -977,7 +977,7 @@ EOF
         echo -e "${BOLD}${MAGENTA}📁 Output Location 📁${RESET}"
         echo -e "Suggested folder: ${CYAN}$output_dir${RESET}"
         echo -e "${YELLOW}Press Enter to accept, or type a different folder name:${RESET}"
-        read -p "$(echo -e "${CYAN}> ${RESET}")" folder_override
+        read -r -p "$(echo -e "${CYAN}> ${RESET}")" folder_override
         if [ -n "$folder_override" ]; then
           sanitized_folder=$(sanitize_filename "$folder_override")
           output_dir="$BASE_MUSIC_DIR/$sanitized_folder"
@@ -1073,7 +1073,7 @@ EOF
         echo -e "${BOLD}${MAGENTA}📁 Output Location 📁${RESET}"
         echo -e "Suggested folder: ${CYAN}$output_dir${RESET}"
         echo -e "${YELLOW}Press Enter to accept, or type a different folder name:${RESET}"
-        read -p "$(echo -e "${CYAN}> ${RESET}")" folder_override
+        read -r -p "$(echo -e "${CYAN}> ${RESET}")" folder_override
         if [ -n "$folder_override" ]; then
           sanitized_folder=$(sanitize_filename "$folder_override")
           output_dir="$BASE_MUSIC_DIR/$sanitized_folder"
@@ -1156,7 +1156,8 @@ EOF
   echo -ne "${YELLOW}Checking if input is a playlist...${RESET} "
   local playlist_entry_count=0
   local id_list_output
-  local temp_file2=$(mktemp)
+  local temp_file2
+  temp_file2=$(mktemp)
   yt-dlp --flat-playlist --print id -- "$target_url" > "$temp_file2" 2>/dev/null &
   local pid2=$!
   spinner $pid2
@@ -1190,7 +1191,8 @@ EOF
       meta_fetch_opts+=("--no-playlist")
   fi
 
-  local temp_file=$(mktemp)
+  local temp_file
+  temp_file=$(mktemp)
   yt-dlp "${meta_fetch_opts[@]}" -- "$target_url" > "$temp_file" 2>/dev/null &
   local pid=$!
   spinner $pid
@@ -1209,7 +1211,8 @@ EOF
           log_message "INFO" "Attempting alternative SoundCloud set/playlist title extraction..."
           # Try to get the title directly from the URL or a simpler yt-dlp command
           video_title=$(yt-dlp --get-title --no-playlist -- "$target_url" 2>/dev/null)
-          if [ $? -eq 0 ] && [ -n "$video_title" ]; then
+          title_rc=$?
+          if [ $title_rc -eq 0 ] && [ -n "$video_title" ]; then
               log_message "INFO" "Extracted SoundCloud set/playlist title: $video_title"
           else
               video_title="Unknown_SoundCloud_Set"
@@ -1218,7 +1221,8 @@ EOF
       elif [[ "$target_url" == *"soundcloud.com/tracks/"* ]]; then
           log_message "INFO" "Attempting alternative SoundCloud track title extraction..."
           video_title=$(yt-dlp --get-title --no-playlist -- "$target_url" 2>/dev/null)
-          if [ $? -eq 0 ] && [ -n "$video_title" ]; then
+          title_rc=$?
+          if [ $title_rc -eq 0 ] && [ -n "$video_title" ]; then
               log_message "INFO" "Extracted SoundCloud track title: $video_title"
           else
               video_title="Unknown_SoundCloud_Track"
@@ -1736,7 +1740,8 @@ EOF
         # Verify downloaded files and remove invalid from archive
         local playlist_json
         playlist_json=$(yt-dlp --dump-json --flat-playlist -- "$target_url" 2>/dev/null)
-        if [ $? -eq 0 ] && [ -n "$playlist_json" ]; then
+        playlist_rc=$?
+        if [ $playlist_rc -eq 0 ] && [ -n "$playlist_json" ]; then
           mapfile -t playlist_ids < <(echo "$playlist_json" | jq -r '.entries[].id')
           local valid_count=0
           for file in "$output_base_dir"/*.mp3; do
