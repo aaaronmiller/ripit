@@ -789,6 +789,13 @@ EOF
     process_json_input "$target_url"
     return $?
   fi
+  # --- Unsupported sites (no yt-dlp extractor / DRM) ---
+  if [[ "$target_url" == *"pandora.com"* || "$target_url" == *"pandora.tv"* ]]; then
+    log_message "ERROR" "Pandora URLs are not supported (no yt-dlp extractor; streams are DRM-protected and require login)."
+    echo -e "\n${YELLOW}Try instead:${RESET} paste a YouTube / SoundCloud / Bandcamp / Spotify URL for the same station or tracks,"
+    echo -e "${YELLOW}or:${RESET} use \`$0 -i <audio-file-or-dir>\` to identify already-recorded audio via Shazam."
+    return 1
+  fi
 
   # --- Auto-detect Spotify URLs → route to spotDL ---
   if [[ "$target_url" == *"open.spotify.com"* ]]; then
