@@ -480,6 +480,44 @@ Just pass a Spotify URL — ripit auto-detects and routes to spotDL:
 
 ---
 
+## 📻 Pandora Recording (via `rip-pandora.sh`)
+
+Pandora has no yt-dlp extractor and its streams are login-walled + DRM-protected, so direct download is impossible. Instead, `rip-pandora.sh` plays your station through [pianobar](https://github.com/PromyLOPh/pianobar) (console Pandora client) and records it **silently in the background** — per-track MP3s with ID3 tags, exact boundaries from pianobar events, no splitting needed.
+
+### Setup (once — credentials stay on YOUR machine, never in this repo)
+
+```bash
+sudo apt-get install pianobar ffmpeg pulseaudio-utils
+mkdir -p ~/.config/pianobar && chmod 700 ~/.config/pianobar
+# create ~/.config/pianobar/config with:
+#   user = you@example.com
+#   password_command = gpg --decrypt ~/pandora-pass.gpg   # or: password = ...
+# chmod 600 ~/.config/pianobar/config
+```
+
+### Usage
+
+```bash
+./rip-pandora.sh --list                        # pick your station (interactive)
+./rip-pandora.sh 3188965452988993694 --detach  # record in background, terminal stays free
+./rip-pandora.sh --status                      # check it
+./rip-pandora.sh --stop                        # stop it
+# foreground test: ./rip-pandora.sh <station-id> -o ~/Music/Pandora -t 30
+```
+
+### How it stays silent
+
+- pianobar plays into a dedicated PulseAudio **null sink** (`ripit_pandora`); recording taps only that sink's `.monitor`. Your speakers are never in the path — a routing bug produces silence, not sound.
+- `--detach` runs via `setsid`/`nohup`: survives terminal close, prompt returns immediately.
+
+### Notes
+
+- Needs a US Pandora login (Pandora is US-only; use your own account).
+- Output: `~/Music/Pandora/<Artist>/<Artist> - <Title>.mp3`, tagged with artist/title/album/station.
+- `ripit.sh` already routes `pandora.com` URLs here with instructions.
+
+---
+
 ## Troubleshooting
 
 | Problem | Likely Cause | Fix |
@@ -492,7 +530,8 @@ Just pass a Spotify URL — ripit auto-detects and routes to spotDL:
 | `jq: command not found` | Missing dependency | `apt install jq` or `brew install jq` |
 | Files downloading as `.part` | yt-dlp download interrupted | Script uses `--no-part` to avoid this |
 | Stub files (0-byte or tiny MP3) | Partial/failed downloads | Script auto-removes <100KB files |
-| Spotify/Pandora URL fails | Not supported by yt-dlp (DRM) | Use YouTube/SoundCloud/Bandcamp source instead |
+| Spotify URL fails in `ripit.sh` | spotDL missing | `pip install spotdl`, then retry |
+| Pandora URL fails in `ripit.sh` | No yt-dlp extractor (DRM + login) | Use `rip-pandora.sh <station-id> --detach` to record silently |
 
 ---
 

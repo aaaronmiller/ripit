@@ -790,10 +790,14 @@ EOF
     return $?
   fi
   # --- Unsupported sites (no yt-dlp extractor / DRM) ---
+  # NOTE: Pandora stations CAN be recorded silently in the background with
+  # rip-pandora.sh (pianobar-based; your login stays in
+  # ~/.config/pianobar/config — no credentials in this repo).
   if [[ "$target_url" == *"pandora.com"* || "$target_url" == *"pandora.tv"* ]]; then
-    log_message "ERROR" "Pandora URLs are not supported (no yt-dlp extractor; streams are DRM-protected and require login)."
-    echo -e "\n${YELLOW}Try instead:${RESET} paste a YouTube / SoundCloud / Bandcamp / Spotify URL for the same station or tracks,"
-    echo -e "${YELLOW}or:${RESET} use \`$0 -i <audio-file-or-dir>\` to identify already-recorded audio via Shazam."
+    log_message "ERROR" "Pandora URLs are not supported by yt-dlp (no extractor; streams are DRM-protected and require login)."
+    echo -e "\n${YELLOW}To record a Pandora station silently in the background, use:${RESET}"
+    echo -e "  ${WHITE}$(dirname "$0")/rip-pandora.sh <station-id> --detach${RESET}"
+    echo -e "${YELLOW}Find the station ID${RESET} via ${WHITE}$(dirname "$0")/rip-pandora.sh --list${RESET} (needs your login in ~/.config/pianobar/config)."
     return 1
   fi
 
