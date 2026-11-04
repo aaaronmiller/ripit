@@ -794,11 +794,27 @@ EOF
   # rip-pandora.sh (pianobar-based; your login stays in
   # ~/.config/pianobar/config — no credentials in this repo).
   if [[ "$target_url" == *"pandora.com"* || "$target_url" == *"pandora.tv"* ]]; then
-    log_message "ERROR" "Pandora URLs are not supported by yt-dlp (no extractor; streams are DRM-protected and require login)."
-    echo -e "\n${YELLOW}To record a Pandora station silently in the background, use:${RESET}"
-    echo -e "  ${WHITE}$(dirname "$0")/rip-pandora.sh <station-id> --detach${RESET}"
-    echo -e "${YELLOW}Find the station ID${RESET} via ${WHITE}$(dirname "$0")/rip-pandora.sh --list${RESET} (needs your login in ~/.config/pianobar/config)."
-    return 1
+    local sid=""
+    sid=$(echo "$target_url" | sed -n '"'"'s#.*/station/play/\([0-9]\+\).*#\1#p'"'"')
+    [ -n "$sid" ] || sid=$(echo "$target_url" | sed -n '"'"'s#.*station/\([0-9]\+\).*#\1#p'"'"')
+    sid=$(echo "$sid" | tr -cd '0-9')
+    log_message "INFO" "Pandora station (id=${sid:-unknown}) routed to silent recorder."
+    echo -e "\n${BOLD}${MAGENTA}📻 PANDORA SILENT RECORD 📻${RESET}"
+    echo -e "${WHITE}Same ripit binary. Background recording started. Manage:${RESET}"
+    local rdir rscript
+    rdir=$(dirname "$(readlink -f "$0" 2>/dev/null || echo ".")")
+    rscript="$rdir/rip-pandora.sh"
+    if [ -x "$rscript" ]; then
+      bash "$rscript" "${sid:-3188965452988993694}" --detach -o "$BASE_MUSIC_DIR" >>"$LOG_FILE" 2>&1 &
+      echo -e "${GREEN}Started (silent, no speakers). Commands:${RESET}"
+      echo -e "  bash $rscript --status  (check)"
+      echo -e "  bash $rscript --stop    (end recording)"
+    else
+      log_message "ERROR" "rip-pandora.sh not found at $rscript"
+      echo -e "${RED}Expected beside ripit.sh. Did you clone?${RESET}"
+      return 1
+    fi
+    return 0
   fi
 
   # --- Auto-detect Spotify URLs → route to spotDL ---
