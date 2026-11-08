@@ -28,7 +28,8 @@ Ripit! is a Bash script that downloads audio from **1872+ sites** (yt-dlp-powere
 | **Audio fingerprinting** | Identify unknown tracks via Shazam (shazamio) with automatic 4-pass retry at different offsets |
 | **Auto-tag after split** | When splitting a mixtape, automatically identifies generic tracks (Track_001, etc.) |
 | **Auto-dependency install** | `rip` wrapper script detects missing deps and installs them (pnpm→npm, pip, cargo, apt fallback chain) |
-| **zsh-native alias** | `alias ripit='noglob .../rip'` — no more quoting issues with `?` and `&` |
+| **zsh-native alias** | `alias ripit='noglob .../rip'` protects `?`; pasted `&` is escaped shell-wide by zsh's url-quote-magic (see zsh Note) |
+| **Song-first playlist links** | A song link carrying `&list=` rips just the song, then offers the rest; a YouTube Mix (`list=RD...`) is endless, so it asks how many |
 | **Filename normalization** | All filenames sanitized: special chars → underscores, length capped at **100 characters**, multiple underscores collapsed |
 | **Dedup archive** | `downloaded_archive.txt` prevents re-downloading the same video |
 | **Stub file cleanup** | Automatically removes partial/incomplete downloads (<100 KB) |
@@ -145,6 +146,22 @@ echo "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PLabc" | ./ripit.sh -
 ---
 
 ## Output Structure
+
+### Song links that carry a playlist (`watch?v=...&list=...`)
+
+A link copied while a playlist or Mix is playing names both the song and the list. Ripit rips **only the song**, then says what the list is and offers the rest:
+
+| List id | What it is | Offer after the song |
+|---|---|---|
+| `RD...` (except `RDCLAK5uy_`) | YouTube **Mix**: generated per request and endless. Two reads of one Mix on 2026-11-08 returned 461 and 807 songs | "Rip the next how many songs?" (0 = none) |
+| `PL...`, `OLAK5uy_...`, `RDCLAK5uy_...` and others | A playlist with a fixed track list | Counts it, then "Rip the rest? [y/N]" |
+
+```zsh
+ripit -p 'https://www.youtube.com/watch?v=ID&list=PLabc'          # whole playlist now
+ripit -p -n 25 'https://www.youtube.com/watch?v=ID&list=RDxyz'    # first 25 songs of a Mix
+```
+
+`-n <count>` caps any playlist. `-p` on a Mix without `-n` falls back to the song only. A playlist page URL (`/playlist?list=...`) is still ripped whole, as before. The download archive skips songs already ripped.
 
 ### Single video / playlist
 
@@ -336,7 +353,7 @@ Both modes support:
 
 ## ⚠️ zsh Note: URL Quoting
 
-zsh interprets `?` and `&` in URLs as glob characters, which causes the shell to fail before ripit even runs:
+Zsh treats `?` as a glob character and `&` as a background operator. Both are interpreted before ripit runs. `noglob` protects `?` only.
 
 ```bash
 # ❌ BROKEN — zsh treats ? as glob & is background operator:
@@ -344,7 +361,9 @@ zsh interprets `?` and `&` in URLs as glob characters, which causes the shell to
 # → zsh: no matches found: https://www.youtube.com/watch?v=VIDEO_ID
 ```
 
-The `rip` wrapper (see below) handles this automatically with `noglob`.
+The `&` fix is shell-wide, not part of ripit: zsh's own `url-quote-magic` escapes `&`, `;`, `(` and `)` inside a URL as you type or paste it, for every command. oh-my-zsh enables it, but the forge CLI plugin replaced the paste widget and bypassed it for pasted text. On this machine `/home/cheta/.config/zsh/paste-url-quote.zsh`, sourced from `~/.zshrc` after forge, restores it. The `ripit` alias keeps `noglob` for `?`. In scripts, or anywhere outside interactive zsh, quote URLs explicitly.
+
+If a previous attempt reports `suspended (tty output)` after downloading, the MP3 may already exist. An unquoted `&` put ripit in the background, where FFmpeg's terminal handling could suspend the process group. Silence detection and splitting now use `-nostdin`. The change does not alter an already-running process; use `fg %1` in the originating terminal if that is still the intended job.
 
 ---
 
@@ -400,7 +419,7 @@ The `rip` script is a zsh wrapper around `ripit.sh` that:
 1. **Checks all dependencies** before running
 2. **Auto-installs missing deps** with your permission
 3. Uses the **best package manager available** (fallback chain)
-4. **No quoting needed** — uses `noglob` to prevent zsh glob expansion of `?` and `&`
+4. **No quoting needed for `?`** via `noglob`; pasted `&` is handled shell-wide (see zsh Note).
 
 ### Package manager fallback chain
 
@@ -413,14 +432,16 @@ For Rust tools: `cargo`
 
 Your `~/.zshrc` should have:
 ```zsh
-alias ripit='noglob /path/to/ripit/rip'
+alias ripit='noglob /path/to/ripit/rip' # Multi-site audio ripper
 ```
 This is pre-configured for this system.
+
+Regression tests run with `python3 -m unittest discover -s tests -v` using a Python environment with `pexpect`, plus installed Zsh, FFmpeg, and the script's normal command dependencies. Tests generate local audio and use disposable shells; they make no network requests.
 
 ### After adding the alias, just type:
 
 ```zsh
-# No quotes needed — noglob handles ? and &
+# Bare URLs work interactively; a song link with &list= rips just the song.
 ripit https://www.youtube.com/watch?v=rCdudeK-2x8
 ripit https://www.youtube.com/watch?v=VIDEO_ID&list=PLabc&t=30s
 

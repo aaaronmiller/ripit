@@ -16,6 +16,9 @@ RESET='\033[0m'
 # It will be updated after the title is fetched.
 CURRENT_LOG_CONTEXT=""
 
+# Absolute path of this script, used to start a follow-up playlist rip.
+RIPIT_SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+
 # Colorful ASCII art banner
 echo -e "${MAGENTA}"
 cat <<'EOF'
@@ -236,7 +239,7 @@ detect_silence_points() {
   # Run ffmpeg, redirecting stderr (where silencedetect logs) to stdout
   # SC2140 Fix: Use a single quoted string for the -af argument
   local filter_string="silencedetect=noise=${noise_db}dB:duration=${duration_s}"
-  ffmpeg_output=$(ffmpeg -hide_banner -nostats \
+  ffmpeg_output=$(ffmpeg -nostdin -hide_banner -nostats \
     -i "$audio_file" \
     -af "$filter_string" \
     -f null - 2>&1)
@@ -244,15 +247,10 @@ detect_silence_points() {
 
   log_message "DEBUG" "ffmpeg silencedetect output:\n$ffmpeg_output"
 
-  # Check exit code - non-zero isn't always an error with '-f null -'
+  # A failed analysis must not supply partial split points.
   if [ "$exit_code" -ne 0 ]; then
-    # Specifically check for common error keywords in the output
-    if echo "$ffmpeg_output" | grep -Eq "Error|Invalid|Cannot|Could not|failed"; then
-      log_message "ERROR" "ffmpeg failed during silence detection (code $exit_code). Check debug output above."
-      return 1
-    else
-      log_message "DEBUG" "ffmpeg exited non-zero ($exit_code) but no explicit error found; likely normal completion for '-f null -'."
-    fi
+    log_message "ERROR" "ffmpeg failed during silence detection (code $exit_code). Check debug output above."
+    return "$exit_code"
   fi
 
   log_message "DEBUG" "Using grep/sed for parsing silence detection output."
@@ -693,6 +691,71 @@ process_json_input() {
 }
 
 
+# --- YouTube song links that carry a playlist ---
+# A watch link copied while a playlist or Mix plays carries &list=<id>. ripit
+# rips only that song by default and offers the rest afterwards.
+# List ids that start with RD are YouTube Mixes: generated per request and
+# endless. RDCLAK5uy_ ids are YouTube Music playlists with a fixed track list.
+
+# Prints "playlist" or "mix" for a YouTube list id.
+youtube_list_kind() {
+  case "$1" in
+    RDCLAK5uy_*) echo "playlist" ;;
+    RD*) echo "mix" ;;
+    *) echo "playlist" ;;
+  esac
+}
+
+# Prints "<video_id> <list_id>" when the URL is a YouTube song link that also
+# carries a list; returns 1 otherwise (plain songs, playlist pages, other sites).
+youtube_song_and_list() {
+  local url="$1" vid="" list=""
+  [[ "$url" =~ ^https?://([a-z]+\.)?(youtube\.com|youtu\.be)/ ]] || return 1
+  if [[ "$url" =~ [?\&]v=([A-Za-z0-9_-]{11}) ]]; then
+    vid="${BASH_REMATCH[1]}"
+  elif [[ "$url" =~ youtu\.be/([A-Za-z0-9_-]{11}) ]]; then
+    vid="${BASH_REMATCH[1]}"
+  fi
+  [[ "$url" =~ [?\&]list=([A-Za-z0-9_-]+) ]] && list="${BASH_REMATCH[1]}"
+  [ -n "$vid" ] && [ -n "$list" ] || return 1
+  echo "$vid $list"
+}
+
+# After a song-only rip: say what the rest of the list is and offer to rip it.
+# Args: <full url> <list id> <playlist|mix> [ripit options to carry over...]
+offer_playlist_rest() {
+  local rest_url="$1" list_id="$2" kind="$3"
+  shift 3
+  local carry_opts=("$@") answer="" count=""
+  echo
+  if [ "$kind" = "mix" ]; then
+    echo -e "${YELLOW}This song was opened from a ${BOLD}YouTube Mix${RESET}${YELLOW} (list=${list_id}).${RESET}"
+    echo -e "${YELLOW}A Mix is auto-generated and endless: YouTube builds a new list on every${RESET}"
+    echo -e "${YELLOW}request and keeps extending it, so there is no \"rest\" to finish.${RESET}"
+    if [ -t 0 ] && [ -t 1 ]; then
+      read -r -p "Rip the next how many songs from this Mix? [0 = none]: " count
+    fi
+    if [[ "$count" =~ ^[1-9][0-9]*$ ]]; then
+      bash "$RIPIT_SELF" "${carry_opts[@]}" -p -n "$count" "$rest_url"
+      return $?
+    fi
+    echo -e "${CYAN}Skipped. To rip 25 songs from it later: ripit -p -n 25 '${rest_url}'${RESET}"
+  else
+    echo -ne "${YELLOW}Counting the playlist...${RESET} "
+    count=$(yt-dlp --flat-playlist --print id -- "$rest_url" 2>/dev/null | grep -c .)
+    echo -e "\r${YELLOW}This song is part of a playlist (list=${list_id}, ${count} songs).${RESET}"
+    if [ -t 0 ] && [ -t 1 ]; then
+      read -r -p "Rip the rest of the playlist? [y/N]: " answer
+    fi
+    if [[ "$answer" =~ ^[Yy] ]]; then
+      bash "$RIPIT_SELF" "${carry_opts[@]}" -p "$rest_url"
+      return $?
+    fi
+    echo -e "${CYAN}Skipped. To rip it later: ripit -p '${rest_url}'${RESET}"
+  fi
+  return 0
+}
+
 # --- Main Rip Function ---
 rip() {
   # Usage/help function with colors
@@ -706,6 +769,9 @@ ${BOLD}${GREEN}Description:${RESET}
   For single videos, attempts to split into tracks using Chapters,
   Timestamped Description, or Silence Detection (in that order).
   For playlists, downloads each video as a separate MP3 file.
+  A song link that carries a playlist (watch?v=...&list=...) rips only the
+  song, then offers the rest. A YouTube Mix (list=RD...) is endless, so it
+  asks how many songs instead.
   If a .json file provided, processes it as a batch music catalog.
 
 ${BOLD}${GREEN}Options:${RESET}
@@ -714,6 +780,8 @@ ${BOLD}${GREEN}Options:${RESET}
   ${YELLOW}-s <sec>${RESET}      Minimum silence duration (default: 1)
   ${YELLOW}-l <file>${RESET}     Log file path (appends if exists)
   ${YELLOW}-i <path>${RESET}     Identify unknown audio track(s) in a file or directory (uses Shazam)
+  ${YELLOW}-p${RESET}             Song link with &list=: rip the whole playlist now (a Mix also needs -n)
+  ${YELLOW}-n <count>${RESET}    Playlist or Mix: rip only the first <count> songs
   ${YELLOW}-h${RESET}             Show this help message
 
 ${BOLD}${GREEN}Input modes:${RESET}
@@ -738,15 +806,22 @@ EOF
   local SILENCE_DB="-30" # Store as number, add 'dB' later
   local SILENCE_SEC="1"
   local LOG_FILE="" # Initialize, might be set by -l
+  local RIP_WHOLE_PLAYLIST=0 PLAYLIST_END=""
 
   # Use getopts for robust option parsing
-  while getopts ":o:d:s:l:i:h" opt; do
+  while getopts ":o:d:s:l:i:pn:h" opt; do
     case $opt in
       o) BASE_MUSIC_DIR="$OPTARG" ;;
       d) SILENCE_DB="$OPTARG" ;;
       s) SILENCE_SEC="$OPTARG" ;;
       l) LOG_FILE="$OPTARG" ;; # Set LOG_FILE if -l is used
       i) IDENTIFY_TARGET="$OPTARG" ;;
+      p) RIP_WHOLE_PLAYLIST=1 ;;
+      n) if [[ "$OPTARG" =~ ^[1-9][0-9]*$ ]]; then
+           PLAYLIST_END="$OPTARG"
+         else
+           log_message "ERROR" "-n needs a whole number of songs, got: $OPTARG"; return 1
+         fi ;;
       h) usage; return 0 ;;
       \?) log_message "ERROR" "Invalid option: -$OPTARG"; usage; return 1 ;;
       :) log_message "ERROR" "Option -$OPTARG requires an argument."; usage; return 1 ;;
@@ -932,6 +1007,27 @@ EOF
   # --- Directory and File Setup ---
   mkdir -p "$BASE_MUSIC_DIR" || { log_message "ERROR" "Could not create base directory '$BASE_MUSIC_DIR'. Check permissions."; return 1; }
   touch "$ARCHIVE_FILE" || { log_message "ERROR" "Could not create/touch archive file '$ARCHIVE_FILE'. Check permissions."; return 1; }
+
+  # --- Song link from inside a YouTube playlist or Mix ---
+  # Rip only the song; offer the rest afterwards. -p rips a playlist now;
+  # an endless Mix needs -p -n <count>.
+  local playlist_rest_url="" playlist_list_id="" playlist_kind="" song_and_list=""
+  local playlist_range_opts=()
+  [ -n "$PLAYLIST_END" ] && playlist_range_opts=(--playlist-end "$PLAYLIST_END")
+  if song_and_list=$(youtube_song_and_list "$target_url"); then
+    playlist_list_id="${song_and_list#* }"
+    playlist_kind=$(youtube_list_kind "$playlist_list_id")
+    if [ "$RIP_WHOLE_PLAYLIST" -eq 1 ] && { [ "$playlist_kind" = "playlist" ] || [ -n "$PLAYLIST_END" ]; }; then
+      log_message "INFO" "Ripping the ${playlist_kind} (list=${playlist_list_id})${PLAYLIST_END:+, first $PLAYLIST_END songs}."
+    else
+      if [ "$RIP_WHOLE_PLAYLIST" -eq 1 ]; then
+        log_message "WARN" "A YouTube Mix is endless; -p needs -n <count>. Ripping the song only."
+      fi
+      playlist_rest_url="$target_url"
+      target_url="https://www.youtube.com/watch?v=${song_and_list%% *}"
+      log_message "INFO" "Link carries a ${playlist_kind} (list=${playlist_list_id}). Ripping this song only: ${CYAN}$target_url${RESET}"
+    fi
+  fi
 
   # --- Fetch Metadata and Detect Type ---
   echo -e "\n${BOLD}${MAGENTA}🔍 FETCHING VIDEO INFO & DETECTING TYPE 🔍${RESET}"
@@ -1185,7 +1281,7 @@ EOF
   local id_list_output
   local temp_file2
   temp_file2=$(mktemp)
-  yt-dlp --flat-playlist --print id -- "$target_url" > "$temp_file2" 2>/dev/null &
+  yt-dlp --flat-playlist "${playlist_range_opts[@]}" --print id -- "$target_url" > "$temp_file2" 2>/dev/null &
   local pid2=$!
   spinner $pid2
   wait $pid2
@@ -1213,7 +1309,7 @@ EOF
   echo -ne "${YELLOW}Fetching title and details...${RESET} "
   local meta_fetch_opts=("--dump-json")
   if [ "$is_playlist" -eq 1 ]; then
-      meta_fetch_opts+=("--flat-playlist")
+      meta_fetch_opts+=("--flat-playlist" "${playlist_range_opts[@]}")
   elif [ "$is_playlist" -eq 0 ] || [ "$is_playlist" -eq -1 ]; then
       meta_fetch_opts+=("--no-playlist")
   fi
@@ -1371,8 +1467,11 @@ EOF
       log_message "DEBUG" "Using --no-playlist flag for single video download."
   elif [ "$is_playlist" -eq 1 ]; then
       # No need for explicit --yes-playlist, it's the default for playlist URLs
+      ytdlp_opts+=("${playlist_range_opts[@]}")
       log_message "DEBUG" "Letting yt-dlp handle playlist download naturally."
   else # is_playlist == -1 (unknown)
+      # Keep the -n cap: an unchecked Mix would otherwise download without end.
+      ytdlp_opts+=("${playlist_range_opts[@]}")
       log_message "DEBUG" "Could not determine type, letting yt-dlp handle playlist decision."
   fi
 
@@ -1587,9 +1686,13 @@ EOF
       log_message "INFO" "No chapters or timestamped tracks found. Trying silence detection..."
       echo -e "${YELLOW}Analyzing audio for silence...${RESET}"
       local silence_points=()
-      # Use mapfile/readarray to read sorted silence points directly
-      mapfile -t silence_points < <(detect_silence_points "$downloaded_audio_file" "$SILENCE_DB" "$SILENCE_SEC")
-      local detect_rc=$? # Get exit status of detect_silence_points
+      # Capture the detector's status, not mapfile's process-substitution status.
+      local silence_output detect_rc
+      silence_output=$(detect_silence_points "$downloaded_audio_file" "$SILENCE_DB" "$SILENCE_SEC")
+      detect_rc=$?
+      if [ "$detect_rc" -eq 0 ] && [ -n "$silence_output" ]; then
+        mapfile -t silence_points <<< "$silence_output"
+      fi
       echo # Newline after potential progress indicators inside detect_silence_points
 
       if [ "$detect_rc" -eq 0 ] && [ ${#silence_points[@]} -gt 0 ]; then
@@ -1681,7 +1784,7 @@ EOF
 
         local ffmpeg_cmd=()
         # Use -vn (no video), -ss (start), -i (input), -acodec copy (fast), map metadata
-        ffmpeg_cmd+=(-hide_banner -nostats -vn -ss "$start_sec" -i "$downloaded_audio_file")
+        ffmpeg_cmd+=(-nostdin -hide_banner -nostats -vn -ss "$start_sec" -i "$downloaded_audio_file")
         if [[ "$end_sec_str" != "EOF" ]]; then
           ffmpeg_cmd+=(-to "$end_sec_str")
         fi
@@ -1846,6 +1949,13 @@ EOF
   if (( RANDOM % 10 == 0 )); then
     sleep 1
     echo -e "${YELLOW}✨ Pro tip: ${WHITE}Check the log file (${LOG_FILE:-none specified}) for detailed info!${RESET}"
+  fi
+
+  # Song-only rip of a playlist link: offer the rest, carrying these options.
+  if [ -n "$playlist_rest_url" ]; then
+    local carry_opts=(-o "$BASE_MUSIC_DIR" -d "$SILENCE_DB" -s "$SILENCE_SEC")
+    [ -n "$LOG_FILE" ] && carry_opts+=(-l "$LOG_FILE")
+    offer_playlist_rest "$playlist_rest_url" "$playlist_list_id" "$playlist_kind" "${carry_opts[@]}"
   fi
 
   # Explicitly return success if we reached the end without errors
