@@ -3,7 +3,7 @@
 Requires installed bash, zsh, ffmpeg, ripit dependencies, and Python pexpect.
 Uses generated audio and isolated shells; makes no network requests.
 Pasted-URL quoting is a shell-wide concern and lives outside this repo
-(/home/cheta/.config/zsh/paste-url-quote.zsh), so it is not tested here.
+(~/.config/zsh/paste-url-quote.zsh), so it is not tested here.
 """
 import os
 from pathlib import Path

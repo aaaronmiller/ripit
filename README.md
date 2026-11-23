@@ -361,7 +361,7 @@ Zsh treats `?` as a glob character and `&` as a background operator. Both are in
 # → zsh: no matches found: https://www.youtube.com/watch?v=VIDEO_ID
 ```
 
-The `&` fix is shell-wide, not part of ripit: zsh's own `url-quote-magic` escapes `&`, `;`, `(` and `)` inside a URL as you type or paste it, for every command. oh-my-zsh enables it, but the forge CLI plugin replaced the paste widget and bypassed it for pasted text. On this machine `/home/cheta/.config/zsh/paste-url-quote.zsh`, sourced from `~/.zshrc` after forge, restores it. The `ripit` alias keeps `noglob` for `?`. In scripts, or anywhere outside interactive zsh, quote URLs explicitly.
+The `&` fix is shell-wide, not part of ripit: zsh's own `url-quote-magic` escapes `&`, `;`, `(` and `)` inside a URL as you type or paste it, for every command. oh-my-zsh enables it, but the forge CLI plugin replaced the paste widget and bypassed it for pasted text. On this machine `~/.config/zsh/paste-url-quote.zsh`, sourced from `~/.zshrc` after forge, restores it. The `ripit` alias keeps `noglob` for `?`. In scripts, or anywhere outside interactive zsh, quote URLs explicitly.
 
 If a previous attempt reports `suspended (tty output)` after downloading, the MP3 may already exist. An unquoted `&` put ripit in the background, where FFmpeg's terminal handling could suspend the process group. Silence detection and splitting now use `-nostdin`. The change does not alter an already-running process; use `fg %1` in the originating terminal if that is still the intended job.
 
